@@ -1017,6 +1017,12 @@ function mountMenuButton() {
         item.addEventListener('click', () => {
             const panel = document.querySelector('.lm-settings-block');
             if (!panel) { toast('面板未挂载', 'warning'); return; }
+            // 面板现在整个是可折叠的：从菜单进来时必须先展开外层，
+            // 否则用户看到的是一个收起的标题行，等于"点了没反应"。
+            if (getDrawerState().root === false) {
+                setDrawerState('root', true);
+                render();
+            }
             panel.scrollIntoView({ behavior: 'smooth', block: 'center' });
             panel.classList.add('lm-flash');
             setTimeout(() => panel.classList.remove('lm-flash'), 1200);

@@ -29,21 +29,14 @@
     box-shadow: 0 0 0 2px var(--lm-warn), 0 0 18px rgba(242, 201, 76, 0.6);
 }
 
-/* ── 头部 ── */
-.lm-head {
-    display: flex;
-    flex-wrap: wrap;
-    justify-content: space-between;
-    align-items: baseline;
-    gap: 6px;
-    margin-bottom: 8px;
-}
-
-.lm-title {
+/* ── 外层折叠块标题（收起时唯一可见的部分） ── */
+.lm-root-name {
     font-weight: 700;
     font-size: 1.05em;
     white-space: nowrap;
 }
+
+.lm-root-name i { margin-right: 3px; }
 
 .lm-badge-demo {
     font-size: 0.7em;
@@ -55,13 +48,15 @@
     vertical-align: middle;
 }
 
-.lm-book {
-    font-size: 0.85em;
-    opacity: 0.85;
+/* 状态摘要：窄屏允许换行，长书名单词内断行，别把标题行撑出横向滚动 */
+.lm-root-sub {
+    flex: 1 1 100%;
+    min-width: 0;
+    font-weight: 400;
     overflow-wrap: anywhere;
 }
 
-.lm-book code {
+.lm-root-sub code {
     background: rgba(127, 127, 127, 0.2);
     padding: 1px 4px;
     border-radius: 3px;
@@ -325,6 +320,24 @@
 .lm-settings-block .inline-drawer {
     border-top: 1px solid rgba(127, 127, 127, 0.25);
     margin-top: 6px;
+}
+
+/* 外层是「扩展本体」，不是内部分区：不要那条顶部分隔线，也不要再往上留 margin */
+.lm-settings-block .inline-drawer.lm-root-drawer {
+    border-top: none;
+    margin-top: 0;
+}
+
+/* 外层标题：略大一点，底下一条线把标题和内容分开 —— 和 ST 内置扩展的区块标题同观感 */
+.lm-settings-block .lm-root-drawer > .inline-drawer-toggle.inline-drawer-header {
+    padding: 2px 2px 8px;
+    border-bottom: 1px solid rgba(127, 127, 127, 0.25);
+    font-size: 1.04em;
+}
+
+/* 子区块整体缩进一级，让「谁在谁里面」一眼可见（含它们的分隔线一起缩进） */
+.lm-settings-block .lm-root-drawer > .inline-drawer-content > .inline-drawer {
+    margin-left: 8px;
 }
 
 .lm-settings-block .inline-drawer-toggle.inline-drawer-header {
