@@ -1,8 +1,38 @@
 # 记忆节点 · LoreMemory（Demo v0.1）
 
 > SillyTavern 第三方扩展｜目标宿主 **SillyTavern 1.18.0**
+> 仓库：**https://github.com/Ushio155/SillyTavern-LoreMemory**（开发分支 `dev`，当前也是默认分支）
 > 这是需求文档《LoreMemory-世界书记忆插件-需求与运行逻辑.md》的**可运行演示版**，用来把"大概效果"
 > 变成"能点、能打字触发、能看账本"的东西。**不是成品**，详见下面的「这个 demo 做了什么/没做什么」。
+
+---
+
+## 安装（含手机）
+
+**方式一：面板安装**
+
+`扩展程序`（魔法棒 🪄）→ `Install extension` → 填仓库地址，分支填 `dev`：
+
+```
+https://github.com/Ushio155/SillyTavern-LoreMemory
+```
+
+**方式二：手动放目录**
+
+把仓库内容整个放进：
+
+```
+<SillyTavern数据目录>/data/<用户名>/extensions/SillyTavern-LoreMemory/
+```
+
+（要求 `manifest.json` 就在该目录下——仓库根目录的结构就是按这个来的。）
+
+装好后**刷新浏览器页面**。手机上 ST 的扩展同样适用；面板已做 ≤640px 的移动端适配
+（按钮两行等宽、设置行改为上下堆叠、输入框 16px 防 iOS 聚焦缩放）。
+
+> ⚠️ **只保留一份副本**。同名扩展同时存在于「用户目录」和 `public/scripts/extensions/third-party/` 时，
+> ST 面板里只显示一条，但**实际加载的是 public 目录那份**（静态目录优先级更高）。
+> 用本仓库的 `install.ps1` 安装时会先清掉旧副本。
 
 ---
 
