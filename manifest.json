@@ -1,0 +1,11 @@
+{
+    "display_name": "记忆节点 · LoreMemory (Demo)",
+    "loading_order": 260,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "lorememory.css",
+    "author": "Ushio155",
+    "version": "0.1.0-demo",
+    "homePage": ""
+}

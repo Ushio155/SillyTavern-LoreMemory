@@ -1,0 +1,538 @@
+/**
+ * LoreMemory 面板样式
+ *
+ * 这里的每一�?对抗宿主"写法都对�?CardLore 已经踩过的坑（见 CardLore-插件技术总结.md §10）：
+ *  - ST �?.menu_button �?min-content 宽度 �?中文按钮会竖排成窄长条，必须 width:auto + nowrap
+ *  - ST 给按钮加 grayscale 滤镜 �?插件配色被去饱和，需要局部重�? *  - 移动�?ST �?body { touch-action: none } �?滚动区要显式 pan-y
+ *  - 窄屏不要�?100vw（滚动条宽度会被重复计算�? */
+
+.lm-settings-block {
+    --lm-ok: #4caf7d;
+    --lm-warn: #f2c94c;
+    --lm-bad: #d94b4b;
+    --lm-key: #6ea8fe;
+    border: 1px solid var(--SmartThemeBorderColor, #555);
+    border-radius: 8px;
+    padding: 10px;
+    margin-bottom: 8px;
+    background: var(--SmartThemeBlurTintColor, rgba(0, 0, 0, 0.2));
+    color: var(--SmartThemeBodyColor, #ddd);
+    /* �?1em 而不�?0.95em：面板里再套 0.85em/0.74em 的标签与提示�?       基数一小就会层层缩到看不清（实测在这一档上标签已经很吃力）�?*/
+    font-size: 1em;
+    transition: box-shadow 0.3s ease;
+}
+
+.lm-settings-block.lm-flash {
+    box-shadow: 0 0 0 2px var(--lm-warn), 0 0 18px rgba(242, 201, 76, 0.6);
+}
+
+/* ── 头部 ── */
+.lm-head {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 6px;
+    margin-bottom: 8px;
+}
+
+.lm-title {
+    font-weight: 700;
+    font-size: 1.05em;
+    white-space: nowrap;
+}
+
+.lm-badge-demo {
+    font-size: 0.7em;
+    padding: 1px 5px;
+    border-radius: 4px;
+    background: var(--lm-warn);
+    color: #222;
+    font-weight: 700;
+    vertical-align: middle;
+}
+
+.lm-book {
+    font-size: 0.85em;
+    opacity: 0.85;
+    overflow-wrap: anywhere;
+}
+
+.lm-book code {
+    background: rgba(127, 127, 127, 0.2);
+    padding: 1px 4px;
+    border-radius: 3px;
+    font-size: 0.95em;
+}
+
+/* ── 状态行 ── */
+.lm-status {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+    gap: 6px;
+    margin-bottom: 10px;
+}
+
+.lm-status-warn {
+    outline: 1px solid var(--lm-bad);
+    outline-offset: 4px;
+    border-radius: 6px;
+}
+
+.lm-stat {
+    display: flex;
+    flex-direction: column;
+    padding: 5px 7px;
+    border-radius: 6px;
+    background: rgba(127, 127, 127, 0.12);
+    min-width: 0;
+}
+
+.lm-k { font-size: 0.78em; opacity: 0.8; }
+.lm-v { font-size: 1.15em; font-weight: 700; }
+.lm-sub { font-size: 0.74em; opacity: 0.78; }
+.lm-dim { opacity: 0.72; font-size: 0.92em; }
+
+.lm-alert {
+    padding: 6px 8px;
+    border-radius: 6px;
+    background: rgba(217, 75, 75, 0.18);
+    border-left: 3px solid var(--lm-bad);
+    margin-bottom: 8px;
+    font-size: 0.88em;
+}
+
+/* ── 按钮 ── */
+.lm-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 10px;
+}
+
+/* 覆盖 ST .menu_button �?min-content �?grayscale */
+.lm-settings-block .menu_button.lm-btn {
+    width: auto;
+    min-width: 0;
+    white-space: nowrap;
+    filter: none;
+    font-size: 0.88em;
+    padding: 5px 10px;
+    margin: 0;
+}
+
+.lm-btn-primary {
+    border-color: var(--lm-ok) !important;
+    color: var(--lm-ok) !important;
+}
+
+.lm-settings-block .menu_button.lm-btn-danger {
+    border-color: var(--lm-bad) !important;
+    color: var(--lm-bad) !important;
+}
+
+.lm-settings-block .menu_button.lm-mini {
+    width: auto;
+    min-width: 0;
+    white-space: nowrap;
+    filter: none;
+    font-size: 0.78em;
+    padding: 2px 7px;
+    margin: 0;
+}
+
+.lm-settings-block .menu_button.lm-mini-danger {
+    color: var(--lm-bad) !important;
+    border-color: var(--lm-bad) !important;
+}
+
+/* ── 区块 ── */
+.lm-section { margin-bottom: 12px; }
+
+.lm-section-title {
+    font-weight: 700;
+    font-size: 0.88em;
+    margin-bottom: 5px;
+    padding-bottom: 3px;
+    border-bottom: 1px solid var(--SmartThemeBorderColor, #555);
+}
+
+.lm-empty {
+    padding: 8px;
+    border-radius: 6px;
+    background: rgba(127, 127, 127, 0.1);
+    font-size: 0.86em;
+    opacity: 0.8;
+    line-height: 1.5;
+}
+
+/* ── 表格 ── */
+.lm-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.84em;
+    table-layout: fixed;
+}
+
+.lm-table th,
+.lm-table td {
+    padding: 3px 5px;
+    text-align: left;
+    border-bottom: 1px solid rgba(127, 127, 127, 0.25);
+    overflow-wrap: anywhere;
+}
+
+.lm-table th { font-size: 0.85em; opacity: 0.7; font-weight: 600; }
+.lm-table .lm-num { text-align: right; white-space: nowrap; }
+.lm-table tfoot td { font-weight: 700; }
+.lm-rec { color: var(--lm-warn); font-weight: 700; }
+
+/* ── 命中原因徽标 ── */
+.lm-reason {
+    display: inline-block;
+    padding: 0 5px;
+    border-radius: 3px;
+    font-size: 0.85em;
+    white-space: nowrap;
+    background: rgba(127, 127, 127, 0.2);
+}
+
+.lm-reason-constant { background: rgba(242, 201, 76, 0.25); color: var(--lm-warn); }
+.lm-reason-key { background: rgba(110, 168, 254, 0.22); color: var(--lm-key); }
+.lm-reason-sticky { background: rgba(76, 175, 125, 0.22); color: var(--lm-ok); }
+.lm-reason-forced { background: rgba(217, 75, 75, 0.25); color: var(--lm-bad); }
+
+/* ── 节点卡片 ── */
+.lm-node {
+    border: 1px solid rgba(127, 127, 127, 0.3);
+    border-radius: 6px;
+    padding: 6px 8px;
+    margin-bottom: 6px;
+    background: rgba(127, 127, 127, 0.07);
+}
+
+.lm-node-off { opacity: 0.45; }
+
+.lm-node-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 5px;
+    margin-bottom: 4px;
+}
+
+.lm-node-id {
+    font-family: monospace;
+    font-size: 0.84em;
+    padding: 0 4px;
+    border-radius: 3px;
+    background: rgba(127, 127, 127, 0.25);
+}
+
+.lm-node-title { font-weight: 700; font-size: 0.95em; }
+.lm-range { font-size: 0.8em; opacity: 0.78; }
+
+.lm-badge {
+    font-size: 0.72em;
+    padding: 1px 5px;
+    border-radius: 3px;
+    white-space: nowrap;
+}
+
+.lm-badge-ok { background: rgba(76, 175, 125, 0.25); color: var(--lm-ok); }
+.lm-badge-warn { background: rgba(242, 201, 76, 0.25); color: var(--lm-warn); }
+.lm-badge-off { background: rgba(127, 127, 127, 0.25); }
+.lm-badge-skel { background: rgba(242, 201, 76, 0.2); color: var(--lm-warn); }
+.lm-badge-tier { background: rgba(127, 127, 127, 0.18); opacity: 0.8; }
+
+.lm-keys {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-bottom: 4px;
+}
+
+.lm-key {
+    font-size: 0.8em;
+    padding: 1px 6px;
+    border-radius: 9px;
+    background: rgba(110, 168, 254, 0.18);
+    border: 1px solid rgba(110, 168, 254, 0.35);
+    color: var(--lm-key);
+}
+
+.lm-node-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    font-size: 0.8em;
+    opacity: 0.85;
+    margin-bottom: 5px;
+}
+
+.lm-over { color: var(--lm-bad); font-weight: 700; opacity: 1; }
+
+.lm-node-ops { display: flex; flex-wrap: wrap; gap: 4px; }
+
+.lm-content {
+    margin-top: 6px;
+    padding: 6px 8px;
+    border-left: 3px solid rgba(127, 127, 127, 0.4);
+    background: rgba(0, 0, 0, 0.15);
+    border-radius: 4px;
+    font-size: 0.8em;
+    line-height: 1.55;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    max-height: 240px;
+    overflow-y: auto;
+    touch-action: pan-y;
+}
+
+.lm-tophits { display: flex; flex-wrap: wrap; gap: 5px; }
+
+.lm-hit-chip {
+    font-size: 0.78em;
+    padding: 2px 7px;
+    border-radius: 10px;
+    background: rgba(76, 175, 125, 0.15);
+    border: 1px solid rgba(76, 175, 125, 0.3);
+}
+
+/* ── 帮助（旧�?details 版本已改成折叠区块，保留少量通用样式�?── */
+.lm-help {
+    font-size: 0.82em;
+    line-height: 1.6;
+    margin-top: 8px;
+}
+
+.lm-help summary { cursor: pointer; font-weight: 700; }
+.lm-help ol { margin: 6px 0 6px 18px; padding: 0; }
+.lm-help li { margin-bottom: 3px; }
+.lm-help code {
+    background: rgba(127, 127, 127, 0.2);
+    padding: 0 3px;
+    border-radius: 3px;
+}
+
+/* ── 生成设置�?── */
+
+/* 折叠区块：外观直接复用主题对 .inline-drawer-* 的样式，这里只补几处"主题没定义也不会�?的兜底，
+   以及本插件特有的标题排版�?*/
+.lm-settings-block .inline-drawer {
+    border-top: 1px solid rgba(127, 127, 127, 0.25);
+    margin-top: 6px;
+}
+
+.lm-settings-block .inline-drawer-toggle.inline-drawer-header {
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 6px 2px;
+    margin: 0;
+}
+
+/* 主题没给 hover 反馈时的兜底 */
+.lm-settings-block .inline-drawer-toggle.inline-drawer-header:hover {
+    background: rgba(127, 127, 127, 0.12);
+    border-radius: 4px;
+}
+
+.lm-drawer-title {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    font-size: 0.92em;
+}
+
+.lm-drawer-title > b { white-space: nowrap; }
+
+.lm-settings-block .inline-drawer-icon {
+    flex: 0 0 auto;
+    opacity: 0.75;
+    font-size: 0.95em;
+}
+
+.lm-settings-block .inline-drawer-content {
+    padding-top: 4px;
+    touch-action: pan-y;
+}
+
+.lm-section-sub {
+    font-size: 0.8em;
+    margin-bottom: 5px;
+}
+
+.lm-tophits-title { margin-top: 10px; }
+
+.lm-actions-tight { margin-top: 8px; }
+
+.lm-help-list {
+    margin: 0 0 8px 18px;
+    padding: 0;
+    font-size: 0.85em;
+    line-height: 1.6;
+}
+
+.lm-help-list li { margin-bottom: 3px; }
+
+.lm-cmd-table td:first-child { white-space: nowrap; width: 40%; }
+.lm-cmd-table code { font-size: 0.95em; }
+
+.lm-setting-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    margin: 4px 0 8px;
+}
+
+.lm-set-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas: "label control" "hint hint";
+    align-items: center;
+    gap: 2px 10px;
+    padding-bottom: 5px;
+    border-bottom: 1px dashed rgba(127, 127, 127, 0.22);
+}
+
+.lm-set-label {
+    grid-area: label;
+    font-size: 0.92em;
+    font-weight: 600;
+    overflow-wrap: anywhere;
+}
+
+.lm-set-control {
+    grid-area: control;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.lm-set-hint {
+    grid-area: hint;
+    font-size: 0.79em;
+    opacity: 0.72;
+    line-height: 1.45;
+}
+
+/* 设置区内的输入控件对�?ST �?.text_pole 宽度与字�?*/
+.lm-settings-block .lm-num-input {
+    width: 78px;
+    min-width: 0;
+    text-align: right;
+    font-size: 16px; /* �?iOS 聚焦自动放大 */
+    padding: 3px 6px;
+}
+
+.lm-settings-block .lm-select {
+    width: auto;
+    min-width: 150px;
+    max-width: 100%;
+    font-size: 16px;
+    padding: 3px 6px;
+}
+
+.lm-settings-block input[type="checkbox"] {
+    width: 18px;
+    height: 18px;
+    min-width: 0;
+    margin: 0;
+    cursor: pointer;
+}
+
+/* ── 提示词编辑区 ── */
+.lm-prompt-block {
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px solid rgba(127, 127, 127, 0.3);
+}
+
+.lm-prompt-head {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 5px;
+}
+
+.lm-field-label { font-size: 0.85em; font-weight: 700; }
+
+.lm-settings-block .lm-prompt-textarea {
+    width: 100%;
+    box-sizing: border-box;
+    min-height: 120px;
+    max-height: 320px;
+    resize: vertical;
+    font-family: ui-monospace, Consolas, monospace;
+    font-size: 13px;
+    line-height: 1.55;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    touch-action: pan-y;
+    margin-bottom: 4px;
+}
+
+.lm-hint {
+    font-size: 0.79em;
+    opacity: 0.75;
+    line-height: 1.5;
+    margin-top: 3px;
+}
+
+.lm-hint code,
+.lm-alert code {
+    background: rgba(127, 127, 127, 0.22);
+    padding: 0 3px;
+    border-radius: 3px;
+    font-size: 0.95em;
+}
+
+.lm-badge-auto {
+    background: rgba(76, 175, 125, 0.25);
+    color: var(--lm-ok);
+    border: 1px solid rgba(76, 175, 125, 0.45);
+}
+
+.lm-alert-warn {
+    background: rgba(242, 201, 76, 0.16);
+    border-left-color: var(--lm-warn);
+}
+
+/* ── 移动�?── */
+@media (max-width: 640px) {
+    .lm-settings-block { font-size: 0.9em; padding: 8px; }
+
+    /* 按钮两行等宽铺满（沿�?CardLore 的布局不变量） */
+    .lm-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+
+    .lm-settings-block .menu_button.lm-btn {
+        width: 100%;
+        justify-content: center;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
+    .lm-status { grid-template-columns: 1fr 1fr; }
+    .lm-table { font-size: 0.8em; }
+    .lm-table th:nth-child(4),
+    .lm-table td:nth-child(4) { display: none; } /* 窄屏隐藏"为什�?�?*/
+
+    /* 窄屏下设置行改成上下堆叠，控件占满整�?*/
+    .lm-set-row {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-areas: "label" "control" "hint";
+    }
+
+    .lm-set-control { justify-content: flex-start; }
+    .lm-settings-block .lm-select { min-width: 0; width: 100%; }
+    .lm-settings-block .lm-num-input { width: 90px; }
+    .lm-prompt-textarea { min-height: 150px; }
+}
