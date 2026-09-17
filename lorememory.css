@@ -1,10 +1,12 @@
 /**
  * LoreMemory 面板样式
  *
- * 这里的每一�?对抗宿主"写法都对�?CardLore 已经踩过的坑（见 CardLore-插件技术总结.md §10）：
- *  - ST �?.menu_button �?min-content 宽度 �?中文按钮会竖排成窄长条，必须 width:auto + nowrap
- *  - ST 给按钮加 grayscale 滤镜 �?插件配色被去饱和，需要局部重�? *  - 移动�?ST �?body { touch-action: none } �?滚动区要显式 pan-y
- *  - 窄屏不要�?100vw（滚动条宽度会被重复计算�? */
+ * 这里的每一条「对抗宿主」写法都对应 CardLore 已经踩过的坑（见 CardLore-插件技术总结.md §10）：
+ *  - ST 的 .menu_button 带 min-content 宽度 => 中文按钮会竖排成窄长条，必须 width:auto + nowrap
+ *  - ST 给按钮加 grayscale 滤镜 => 插件配色被去饱和，需要局部重置
+ *  - 移动端 ST 有 body { touch-action: none } => 滚动区要显式 pan-y
+ *  - 窄屏不要用 100vw（滚动条宽度会被重复计算）
+ */
 
 .lm-settings-block {
     --lm-ok: #4caf7d;
@@ -17,7 +19,8 @@
     margin-bottom: 8px;
     background: var(--SmartThemeBlurTintColor, rgba(0, 0, 0, 0.2));
     color: var(--SmartThemeBodyColor, #ddd);
-    /* �?1em 而不�?0.95em：面板里再套 0.85em/0.74em 的标签与提示�?       基数一小就会层层缩到看不清（实测在这一档上标签已经很吃力）�?*/
+    /* 用 1em 而不是 0.95em：面板里还要再套 0.85em / 0.74em 的标签与提示，
+       基数一小就会层层缩到看不清（实测在这一档上标签已经很吃力）。 */
     font-size: 1em;
     transition: box-shadow 0.3s ease;
 }
@@ -110,7 +113,7 @@
     margin-bottom: 10px;
 }
 
-/* 覆盖 ST .menu_button �?min-content �?grayscale */
+/* 覆盖 ST .menu_button 的 min-content 与 grayscale */
 .lm-settings-block .menu_button.lm-btn {
     width: auto;
     min-width: 0;
@@ -299,7 +302,7 @@
     border: 1px solid rgba(76, 175, 125, 0.3);
 }
 
-/* ── 帮助（旧�?details 版本已改成折叠区块，保留少量通用样式�?── */
+/* ── 帮助 ── */
 .lm-help {
     font-size: 0.82em;
     line-height: 1.6;
@@ -315,10 +318,10 @@
     border-radius: 3px;
 }
 
-/* ── 生成设置�?── */
+/* ── 生成设置区 ── */
 
-/* 折叠区块：外观直接复用主题对 .inline-drawer-* 的样式，这里只补几处"主题没定义也不会�?的兜底，
-   以及本插件特有的标题排版�?*/
+/* 折叠区块：外观直接复用主题对 .inline-drawer-* 的样式，这里只补几处「主题没定义也不会坏」的兜底，
+   以及本插件特有的标题排版。 */
 .lm-settings-block .inline-drawer {
     border-top: 1px solid rgba(127, 127, 127, 0.25);
     margin-top: 6px;
@@ -421,12 +424,12 @@
     line-height: 1.45;
 }
 
-/* 设置区内的输入控件对�?ST �?.text_pole 宽度与字�?*/
+/* 设置区内的输入控件对抗 ST 的 .text_pole 宽度与字号 */
 .lm-settings-block .lm-num-input {
     width: 78px;
     min-width: 0;
     text-align: right;
-    font-size: 16px; /* �?iOS 聚焦自动放大 */
+    font-size: 16px; /* 防 iOS 聚焦自动放大 */
     padding: 3px 6px;
 }
 
@@ -505,11 +508,11 @@
     border-left-color: var(--lm-warn);
 }
 
-/* ── 移动�?── */
+/* ── 移动端 ── */
 @media (max-width: 640px) {
-    .lm-settings-block { font-size: 0.9em; padding: 8px; }
+    .lm-settings-block { font-size: 0.95em; padding: 8px; }
 
-    /* 按钮两行等宽铺满（沿�?CardLore 的布局不变量） */
+    /* 按钮两行等宽铺满（沿用 CardLore 的布局不变量） */
     .lm-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
 
     .lm-settings-block .menu_button.lm-btn {
@@ -522,10 +525,12 @@
 
     .lm-status { grid-template-columns: 1fr 1fr; }
     .lm-table { font-size: 0.8em; }
-    .lm-table th:nth-child(4),
-    .lm-table td:nth-child(4) { display: none; } /* 窄屏隐藏"为什�?�?*/
 
-    /* 窄屏下设置行改成上下堆叠，控件占满整�?*/
+    /* 窄屏隐藏「为什么」列 */
+    .lm-table th:nth-child(4),
+    .lm-table td:nth-child(4) { display: none; }
+
+    /* 窄屏下设置行改成上下堆叠，控件占满整行 */
     .lm-set-row {
         grid-template-columns: minmax(0, 1fr);
         grid-template-areas: "label" "control" "hint";
