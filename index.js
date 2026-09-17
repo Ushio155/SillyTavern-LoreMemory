@@ -66,6 +66,7 @@ import {
     extractKeywordsHeuristic,
 } from './src/settings.js';
 import { renderPanel, escapeHtml } from './src/ui.js';
+import { isRealChatContext, noChatReason } from './src/context.js';
 
 const MODULE_NAME = 'LoreMemory';
 const RECALL_KEY = 'LoreMemory_recall';
@@ -73,6 +74,9 @@ const PANEL_ID = 'lm_panel_root';
 
 /** 骨架刷新时最多回看多少条消息（避免骨架提示词爆上下文） */
 const SKELETON_LOOKBACK = 40;
+
+/** 我们的聊天世界书统一用这个前缀命名（「清理空书」也靠它识别） */
+const BOOK_PREFIX = 'LM-';
 
 // ───────────────────────── 模块级瞬时状态（不进存档） ─────────────────────────
 
@@ -206,6 +210,16 @@ async function ensureBook({ interactive = true } = {}) {
     const ctx = getCtx();
     const cm = ctx.chatMetadata;
     if (!cm) return { ok: false, reason: '还没有打开任何聊天' };
+
+    // ① 先确认"真的在一个聊天里"。
+    //    注意这道闸必须放在"消息条数"前面：ST 的欢迎屏会往 chat 里塞一条助手问候语，
+    //    让它看起来像有内容的聊天，但那个上下文没有 chatId、没有角色，
+    //    绑定进去的书永远不会落盘 —— 每次刷新都会重来一遍，攒出一堆空书。
+    //    详见 src/context.js 的注释。
+    if (!isRealChatContext(ctx)) {
+        return { ok: false, reason: noChatReason(ctx), noChat: true };
+    }
+
     if (!chatMessages().length) {
         return { ok: false, reason: '当前聊天是空的：请先发一条消息（插件用楼号做节点区间）' };
     }
@@ -247,7 +261,7 @@ async function ensureBook({ interactive = true } = {}) {
     // ④ 新建
     const chatIdPart = String(ctx.chatId || '').slice(0, 8) || 'nocid';
     const charName = ctx.name2 || ctx.characters?.[ctx.characterId]?.name || 'chat';
-    const base = `LM-${charName}-${chatIdPart}`;
+    const base = `${BOOK_PREFIX}${charName}-${chatIdPart}`;
     const name = getFreeWorldName(base);
     await saveWorldInfo(name, { entries: {} }, true);
     await updateWorldInfoList();
@@ -691,6 +705,69 @@ async function clearMemory() {
     toast('已清空记忆条目', 'success');
 }
 
+/**
+ * 清理空书：收拾历史遗留的垃圾世界书。
+ *
+ * 只删**同时**满足这三条的书，一条不满足就不动：
+ *   ① 名字以 `LM-` 开头（我们自己建的）
+ *   ② 里面一条条目都没有（空书没有任何信息，删了不会丢数据）
+ *   ③ 不是当前聊天绑定的那本
+ *
+ * 存在的意义：早期版本会把 ST 欢迎屏当成聊天，每次刷新建一本空书
+ * （`LM-xxx-nocid`、`LM-xxx-nocid (2)`……）。建书的 bug 已经修了，
+ * 但这些书还留在用户的磁盘上，得给个一键收拾的办法。
+ */
+async function cleanupEmptyBooks() {
+    const ctx = getCtx();
+    const bound = ctx.chatMetadata?.[METADATA_KEY] || '';
+    const names = (typeof ctx.getWorldInfoNames === 'function' ? ctx.getWorldInfoNames() : []) || [];
+    const candidates = names.filter(n => typeof n === 'string' && n.startsWith(BOOK_PREFIX) && n !== bound);
+
+    const empties = [];
+    for (const n of candidates) {
+        try {
+            const data = await loadWorldInfo(n);
+            if (data && Object.keys(data.entries || {}).length === 0) empties.push(n);
+        } catch (e) {
+            // 读不出来就跳过：宁可不删，也不误删
+            console.warn('[LoreMemory] 检查空书失败，跳过：', n, e);
+        }
+    }
+
+    if (!empties.length) {
+        toast(`没有可清理的空书（检查了 ${candidates.length} 本 ${BOOK_PREFIX} 开头的书）`);
+        return { removed: 0, checked: candidates.length };
+    }
+
+    const preview = empties.slice(0, 10).map(n => `　· ${n}`).join('\n');
+    const more = empties.length > 10 ? `\n　…… 还有 ${empties.length - 10} 本` : '';
+    if (!window.confirm(
+        `找到 ${empties.length} 本空的世界书（LoreMemory 建的、里面一条条目都没有）：\n\n` +
+        `${preview}${more}\n\n` +
+        '删除它们吗？\n（有内容的书一律不动；当前聊天绑定的那本也不动）')) {
+        return { removed: 0, cancelled: true };
+    }
+
+    let removed = 0;
+    for (const n of empties) {
+        try {
+            const res = await fetch('/api/worldinfo/delete', {
+                method: 'POST',
+                headers: ctx.getRequestHeaders(),
+                body: JSON.stringify({ name: n }),
+            });
+            if (res.ok) removed++;
+            else console.warn('[LoreMemory] 删除空书被拒绝：', n, res.status);
+        } catch (e) {
+            console.warn('[LoreMemory] 删除空书失败：', n, e);
+        }
+    }
+    await updateWorldInfoList();
+    toast(`已清理 ${removed} 本空书`, 'success');
+    render();
+    return { removed, found: empties.length };
+}
+
 // ───────────────────────── 钉选与召回（FR-10） ─────────────────────────
 
 /**
@@ -916,6 +993,7 @@ async function onPanelClick(ev) {
             case 'restore-skeleton-prompt': restoreDefaultSkeletonPrompt(); render(); toast('已恢复默认骨架提示词', 'success'); break;
             case 'refresh': await refreshBookState(); toast('已刷新', 'info'); break;
             case 'clear': await clearMemory(); break;
+            case 'cleanup-books': await cleanupEmptyBooks(); break;
             case 'pin': await pinNode(uid); break;
             case 'resummarize': await resummarizeNode(state, nodeByUid(state, uid)); break;
             case 'toggle': {
@@ -1216,8 +1294,16 @@ async function init() {
         }
     });
 
-    // 进插件时如果已经在一个聊天里且开了自动记忆，补一次建书
-    setTimeout(() => { onChatChanged().catch(() => { /* ignore */ }); }, 2000);
+    // 进插件时如果已经在一个聊天里且开了自动记忆，补一次建书。
+    // 这里必须**先确认真的在聊天里**：刷新时 ST 可能正停在欢迎屏，
+    // 那一屏也有"消息"（它自己塞的助手问候语），无条件补建书会在每次刷新时
+    // 造出一本绑不上任何聊天的空书。
+    setTimeout(() => {
+        try {
+            if (!isRealChatContext(getCtx())) return;
+        } catch { return; }
+        onChatChanged().catch(() => { /* ignore */ });
+    }, 2000);
 
     console.log('[LoreMemory] 演示版已加载');
 }
@@ -1236,6 +1322,7 @@ window.LoreMemory = {
     get settings() { return getSettings(); },
     seedDemo, clearMemory, summarizePending, refreshSkeleton, resummarizeNode,
     pinNode, recallKeys, ensureBook, getSettings, updateSetting,
+    cleanupEmptyBooks, isRealChatContext,
     // 流水线分段：可以在不调模型的前提下验证"拼提示词"与"落库"两段
     buildNodePrompt, applyNodeOutput, pendingRange,
     render, scheduleAutoWork,

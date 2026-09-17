@@ -254,6 +254,18 @@ function bodySettings(ctx) {
 
     <div class="lm-actions lm-actions-tight">
         <button class="menu_button lm-btn" data-lm-action="refresh-skeleton"><i class="fa-solid fa-id-card"></i> 立刻刷新骨架现状卡</button>
+    </div>
+
+    <div class="lm-prompt-block">
+        <div class="lm-field-label">维护</div>
+        <div class="lm-hint">
+            早期版本会把 ST 的欢迎屏（选角色卡那一屏）误当成聊天，每次刷新都建一本空书。
+            建书的逻辑已经修好，但那些空书还留在世界里：「清理空书」只删
+            <b>名字以 <code>LM-</code> 开头、里面一条条目都没有、且当前聊天没绑定</b>的书，有内容的一律不动。
+        </div>
+        <div class="lm-actions lm-actions-tight">
+            <button class="menu_button lm-btn" data-lm-action="cleanup-books"><i class="fa-solid fa-broom"></i> 清理空书</button>
+        </div>
     </div>`;
 }
 
