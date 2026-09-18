@@ -135,6 +135,17 @@ export const KEY_OUTSIDE_RATIO_MAX = 0.25;
 export const KEY_OMNIPRESENT_RATIO_MAX = 0.5;
 
 /**
+ * 比率必须配最小绝对次数 —— 这是 E2E 抓出来的一个真实缺陷。
+ *
+ * 只有 6 楼的聊天里，一个词在区间外出现 **1 次**就是 1/4 = 25%，正好撞上阈值被误剔：
+ * driver 的「兜底抽词」用例断言 `魔界狩猎场` 应该保留，结果被我第一版闸门判死了。
+ * 比率在**小样本上会被放大**，所以"到处都命中"至少要命中 2 次，
+ * "铺满全篇"至少要有 3 次出现才算数。
+ */
+export const KEY_OUTSIDE_MIN_COUNT = 2;
+export const KEY_OMNIPRESENT_MIN_COUNT = 3;
+
+/**
  * 关键词判别力自检（FR-14 的第二层，来自真实案例）。
  *
  * 为什么 `checkKeys` 不够：它只看"这个词本身可不可疑"（1 个字 / 10 词黑名单），
@@ -189,13 +200,16 @@ export function keyStats(keys, messages, range) {
 export function dropIndiscriminativeKeys(keys, messages, range, opts = {}) {
     const outsideMax = Number(opts.outsideRatioMax) || KEY_OUTSIDE_RATIO_MAX;
     const omniMax = Number(opts.omnipresentRatioMax) || KEY_OMNIPRESENT_RATIO_MAX;
+    const outsideMin = Number(opts.outsideMinCount) || KEY_OUTSIDE_MIN_COUNT;
+    const omniMin = Number(opts.omnipresentMinCount) || KEY_OMNIPRESENT_MIN_COUNT;
 
     const stats = keyStats(keys, messages, range);
     const keep = [];
     const dropped = [];
     for (const s of stats) {
-        if (s.allRatio >= omniMax) dropped.push({ ...s, reason: 'omnipresent' });
-        else if (s.outsideRatio >= outsideMax) dropped.push({ ...s, reason: 'outside' });
+        // 比率 + 最小次数双条件：小样本里 1/4 也是 25%，不能凭这个判死一个好词
+        if (s.all >= omniMin && s.allRatio >= omniMax) dropped.push({ ...s, reason: 'omnipresent' });
+        else if (s.outside >= outsideMin && s.outsideRatio >= outsideMax) dropped.push({ ...s, reason: 'outside' });
         else keep.push(s.key);
     }
     return { keep, dropped, stats };

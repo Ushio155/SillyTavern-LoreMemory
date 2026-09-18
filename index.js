@@ -51,7 +51,7 @@ import {
     nodeByUid,
     recordTurn,
 } from './src/store.js';
-import { nodeEntryPatch, skeletonEntryPatch, inferReason } from './src/entry.js';
+import { nodeEntryPatch, skeletonEntryPatch, inferReason, TIER_ORDER, TIER_LABEL } from './src/entry.js';
 import { DEMO_NODES, DEMO_SKELETON, checkKeys, dropIndiscriminativeKeys } from './src/seed.js';
 import {
     normalizeSettings,
@@ -338,7 +338,7 @@ async function writeSkeletonEntryOnly(state, node) {
 }
 
 /** 骨架在节点列表里的展示记录 */
-function upsertSkeletonRecord(state, content) {
+function upsertSkeletonRecord(state, content, status = 'active') {
     const tokens = estimateTokens(content);
     let rec = state.nodes.find(n => n.id === 'SKEL');
     if (!rec) {
@@ -352,7 +352,8 @@ function upsertSkeletonRecord(state, content) {
         rec.content = content;
         rec.tokens = tokens;
         rec.uid = state.skeletonUid;
-        rec.status = 'active';
+        // 状态不再无条件写 active：手动禁用过的骨架不该被下一次自动刷新悄悄复活（F11）
+        rec.status = status;
     }
 }
 
@@ -383,6 +384,7 @@ function promptVars(text, count, from, to) {
     return {
         messages: text,
         words: getSettings().promptWords,
+        skeletonWords: getSettings().skeletonWords,
         count,
         from: from + 1,
         to: to + 1,
@@ -481,7 +483,9 @@ async function applyNodeOutput(raw, from, to) {
         droppedKeys: g.dropped.map(d => d.key),
         content: parsed.summary,
         tokens: 0,
-        tier: 'side',
+        // tier 决定 order 阶梯（main 500 / side 300 / detail 100）。以前这里硬编码 'side'，
+        // 于是 FR-15 的"分层召回"对节点从未生效 —— 所有节点同权，预算紧张时谁被挤掉是随机的。
+        tier: parsed.tier,
         status: review ? 'needs_review' : 'active',
         hits: 0,
         lastHitAt: null,
@@ -568,6 +572,11 @@ async function refreshSkeleton(state, { manual = false } = {}) {
     const chat = chatMessages();
     if (!chat.length) { if (manual) toast('聊天是空的', 'warning'); return { ok: false }; }
 
+    // 手动禁用过的骨架，自动刷新必须绕开它（否则"禁用"活不过 24 楼）——手动刷新才重新启用
+    const prevRec = (state.nodes || []).find(n => n.id === 'SKEL');
+    const wasDisabled = prevRec && prevRec.status === 'disabled';
+    if (wasDisabled && !manual) return { ok: false, reason: 'skeleton-disabled' };
+
     const from = Math.max(0, chat.length - SKELETON_LOOKBACK);
     const { text, used } = transcriptFor(from, chat.length - 1, settings);
     if (!used) { if (manual) toast('最近的消息按当前扫描范围被全部过滤，骨架未刷新', 'warning'); return { ok: false }; }
@@ -602,7 +611,7 @@ async function refreshSkeleton(state, { manual = false } = {}) {
     }
 
     await writeSkeleton(state, gate.content);
-    upsertSkeletonRecord(state, gate.content);
+    upsertSkeletonRecord(state, gate.content, 'active');
     persist();
     render();
 
@@ -610,7 +619,7 @@ async function refreshSkeleton(state, { manual = false } = {}) {
         const tail = gate.overCapRemain ? '，仍略超上限' : '';
         toast(`骨架已整理：${gate.actions.join('；')}｜${gate.rawTokens} → ${gate.tokens} token${tail}`, 'info');
     } else if (manual) {
-        toast('骨架现状卡已刷新', 'success');
+        toast(wasDisabled ? '骨架现状卡已刷新并重新启用' : '骨架现状卡已刷新', 'success');
     }
     return { ok: true, tokens: gate.tokens, actions: gate.actions };
 }
@@ -643,6 +652,7 @@ async function resummarizeNode(state, node) {
     // 保留上一版正文，便于回溯（需求文档 FR-11「可撤销」）
     node.prevContent = node.content;
     node.title = parsed.title;
+    node.tier = parsed.tier;
     node.keys = g.keys;
     node.droppedKeys = g.dropped.map(d => d.key);
     node.content = parsed.summary;
@@ -655,6 +665,47 @@ async function resummarizeNode(state, node) {
     render();
     const extra = g.dropped.length ? `；已剔除误触发关键词 ${g.dropped.map(d => d.key).join('、')}` : '';
     toast(`已重新总结 ${node.id}（uid 未变，粘滞/冷却状态保留）${extra}`, g.dropped.length ? 'info' : 'success');
+}
+
+/**
+ * 手工改节点的优先级档位（F8）。
+ * tier → order：main 500 / side 300 / detail 100（entry.js 的 TIER_ORDER）。
+ * 顺序改完必须重写条目 —— order 是条目字段，不是插件内存里的展示值。
+ */
+async function saveNodeTier(uid, tier) {
+    const state = getState();
+    const node = nodeByUid(state, uid);
+    if (!node) return;
+    if (node.id === 'SKEL') { toast('骨架的优先级固定为最高（order 900）', 'warning'); return; }
+    const next = ['main', 'side', 'detail'].includes(String(tier)) ? String(tier) : 'side';
+    if (node.tier === next) return;
+
+    node.tier = next;
+    await writeNode(state, node);
+    persist();
+    render();
+    toast(`${node.id} 优先级 → ${TIER_LABEL[next] || next}（order ${TIER_ORDER[next]}）`, 'success');
+}
+
+/**
+ * 回滚到重摘要前的正文（FR-11「可撤销」）。
+ * 以前 `prevContent` 写进去就没人读，而且 `store.js` 的白名单连存都存不住。
+ * 做成"对调"：回滚本身也可被再回滚，不会丢东西。
+ */
+async function rollbackNodeContent(uid) {
+    const state = getState();
+    const node = nodeByUid(state, uid);
+    if (!node) return;
+    if (node.id === 'SKEL') { toast('骨架请用「立刻刷新骨架现状卡」', 'warning'); return; }
+    if (!node.prevContent) { toast('这个节点没有可回滚的上一版', 'warning'); return; }
+
+    const current = node.content;
+    node.content = node.prevContent;
+    node.prevContent = current;      // 对调 → 可以再滚回去
+    await writeNode(state, node);
+    persist();
+    render();
+    toast(`${node.id} 已回滚到上一版正文（再点一次可滚回来）`, 'success');
 }
 
 /**
@@ -1060,6 +1111,12 @@ async function onPanelSettingChange(ev) {
         await saveNodeKeys(Number(keysEl.dataset.lmKeys), keysEl.value);
         return;
     }
+    // 节点优先级下拉（F8）：改 order 阶梯
+    const tierEl = ev.target.closest('[data-lm-tier]');
+    if (tierEl) {
+        await saveNodeTier(Number(tierEl.dataset.lmTier), tierEl.value);
+        return;
+    }
     const el = ev.target.closest('[data-lm-setting]');
     if (!el) return;
     if (el.tagName === 'TEXTAREA') return;
@@ -1138,6 +1195,7 @@ async function onPanelClick(ev) {
                 }
                 break;
             }
+            case 'rollback': await rollbackNodeContent(uid); break;
             case 'delete': {
                 const node = nodeByUid(state, uid);
                 if (!node) return;

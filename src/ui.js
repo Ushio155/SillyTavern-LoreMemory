@@ -18,7 +18,7 @@
  */
 
 import { estimateTokens, fmtTokens } from './tokens.js';
-import { REASON_LABEL, TIER_LABEL } from './entry.js';
+import { REASON_LABEL, TIER_LABEL, TIER_ORDER } from './entry.js';
 import { avgInjectedTokens, topHitNodes } from './store.js';
 import { SETTINGS_META, PLACEHOLDERS, unknownPlaceholders, isCustomPrompt, isCustomSkeletonPrompt } from './settings.js';
 
@@ -331,12 +331,16 @@ function nodeRow(node, ctx) {
             <span>命中 ${node.hits || 0} 次</span>
             ${node.lastHitAt ? `<span>最近 第${node.lastHitAt}楼</span>` : ''}
             <span class="lm-dim">uid ${node.uid}</span>
+            ${!skeleton ? `<select class="text_pole lm-select lm-tier-select" data-lm-tier="${node.uid}" title="优先级档位：决定预算紧张时谁先被挤掉（main 500 / side 300 / detail 100）">
+                ${['main', 'side', 'detail'].map(t => `<option value="${t}" ${node.tier === t ? 'selected' : ''}>${TIER_LABEL[t] || t}</option>`).join('')}
+            </select>` : `<span class="lm-dim">order ${TIER_ORDER.skeleton}</span>`}
         </div>
         <div class="lm-node-ops">
             <button class="menu_button lm-mini" data-lm-action="pin" data-lm-uid="${node.uid}" title="强制注入一次（本回合生效）"><i class="fa-solid fa-thumbtack"></i> 钉选</button>
             <button class="menu_button lm-mini" data-lm-action="toggle" data-lm-uid="${node.uid}">${node.status === 'disabled' ? '启用' : '禁用'}</button>
             <button class="menu_button lm-mini" data-lm-action="edit" data-lm-uid="${node.uid}">看正文</button>
             ${!skeleton ? `<button class="menu_button lm-mini" data-lm-action="edit-keys" data-lm-uid="${node.uid}" title="手工改关键词（改完失焦或回车保存）">改关键词</button>` : ''}
+            ${(!skeleton && node.prevContent) ? `<button class="menu_button lm-mini" data-lm-action="rollback" data-lm-uid="${node.uid}" title="回滚到重摘要前的正文（再点一次可滚回来）">回滚正文</button>` : ''}
             <button class="menu_button lm-mini" data-lm-action="resummarize" data-lm-uid="${node.uid}" title="用当前提示词重新总结这一段">重摘要</button>
             <button class="menu_button lm-mini lm-mini-danger" data-lm-action="delete" data-lm-uid="${node.uid}">删除</button>
         </div>

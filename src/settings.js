@@ -11,7 +11,7 @@
 export const SETTINGS_VERSION = 2;
 
 /** 默认提示词的版本号：改默认提示词时 +1，老用户保存过的会自动迁移（沿用 CardLore 的做法） */
-export const DEFAULT_PROMPT_VERSION = 1;
+export const DEFAULT_PROMPT_VERSION = 2;
 
 /**
  * 默认摘要提示词。
@@ -28,12 +28,18 @@ export const DEFAULT_PROMPT = `你在为一段角色扮演聊天做「记忆归�
 - 只记录**已经发生的事实**，不要推测、不要续写、不要评价。
 - 正文用五个固定小标题组织：发生了什么 / 谁在场 / 状态变化 / 未结钩子 / 关键设定。
 - 正文总长不超过 {{words}} 个字。
-- 关键词给 3–8 个，必须是**专有名词或独特称谓**（地名、物品、组织、事件、称谓、别名）。
-  禁止使用主角名与用户名——ST 会把发言人名拼进扫描文本，用主角名做关键词等于每回合必中；
-  也禁止「剑」「人」「这里」这类高频词。宁可少给，也不要给会误触发的词。
+- 关键词给 3–6 个，必须**同时**满足下面三条：
+  ① 是**只在这段剧情里才会出现的具体事物**（地名、物品、组织、事件、称谓、别名、专有名词）；
+  ② 不是主角名、不是用户名——ST 会把发言人名拼进扫描文本，用主角名做关键词等于每回合必中；
+  ③ 在最近 10 条消息里出现过 3 条以上的词，一律不要用。
+- **绝对不要把角色卡里的数值/变量名/机制名当关键词**——例如「好感度」「等级」「状态」「能力名」，
+  以及你自己在正文里写出的那些数值字段名。这类词几乎每回合都会出现，一旦做成关键词，
+  这个节点就会在**所有**不相干的场景里被误触发。
+- 宁可只给 2 个精准关键词，也不要给 5 个会误触发的词。
+- tier 只填 main / side / detail 之一：主线剧情的推进填 main，支线或插曲填 side，一次性细节填 detail。
 
 只输出一个 JSON 对象，不要解释、不要代码围栏：
-{"title":"不超过14个字的短标题","keywords":["关键词"],"summary":"结构化正文"}
+{"title":"不超过14个字的短标题","tier":"main|side|detail","keywords":["关键词"],"summary":"结构化正文"}
 
 —— 聊天记录开始（共 {{count}} 条，第 {{from}}-{{to}} 楼）——
 {{messages}}
@@ -43,6 +49,7 @@ export const DEFAULT_PROMPT = `你在为一段角色扮演聊天做「记忆归�
 export const PLACEHOLDERS = {
     messages: '按设置筛选后的聊天记录正文',
     words: '摘要目标长度（对应「摘要目标长度」设置）',
+    skeletonWords: '骨架目标长度（对应「骨架目标长度」设置，只有骨架提示词用得到）',
     count: '本次参与总结的消息条数',
     from: '本次区间的起始楼号',
     to: '本次区间的结束楼号',
@@ -56,20 +63,30 @@ export const PLACEHOLDERS = {
  * 骨架是全书唯一 `constant: true` 的条目，永远注入，所以它必须**短且是当前状态**，
  * 不能变成历史流水——否则它自己就把预算吃光了。
  */
-export const DEFAULT_SKELETON_PROMPT = `你在维护一张「现状卡」。它是这本记忆之书里唯一常驻注入的条目，
-作用是让模型随时知道"现在是什么局面"。
+export const DEFAULT_SKELETON_PROMPT = `你在维护一张「现状卡」。它是这本记忆之书里唯一每回合都注入的条目。
+它是一张**状态表**，不是小说。
 
-输入是上一版现状卡（可能为空）和最近的对话记录。
+【绝对禁止】
+- 禁止场景描写：天气、光线、动作、神态、衣着、环境
+- 禁止对白、禁止【】或括号里的内心独白
+- 禁止续写故事、禁止编造没发生过的对话
+- 只允许写"事实字段"
 
-要求：
-- 输出**当前状态**，不是历史流水。已经过时的信息要删掉，不要越写越长。
-- 上一版里"未结钩子"中、这段对话没有解决的，必须原样保留下来。
-- 正文总长不超过 {{words}} 个字。
-- 用四个固定小节：当前阶段 / 在场人物 / 状态变化 / 未结钩子。
+【输出格式：严格只输出下面这 4 行，一行不多】
+当前阶段：＜一句话，≤20 字＞
+在场：＜只写名字，≤5 个，用、分隔＞
+状态变化：＜只写已经发生的变化，≤3 条，用；分隔＞
+未结钩子：＜≤3 条，用；分隔；没有就写"无"＞
 
-只输出正文本身，不要 JSON、不要解释、不要代码围栏。
+【硬性要求】
+1. **全文不超过 {{skeletonWords}} 个字。** 输出前自己数一遍，超了就删到只剩最关键的字段。
+2. 上一版只作参考。如果上一版描述的场景和最近对话已经对不上，**整张卡全部重写**，
+   不要保留上一版的任何内容。
+3. 未结钩子必须能在最近对话里找到依据。已经解决或已经过期的，必须删掉；
+   宁可写"无"，也不许留旧钩子。
+4. 不要标题、不要 JSON、不要代码围栏、不要解释、不要总结过程。
 
-—— 上一版现状卡 ——
+—— 上一版现状卡（仅供参考，可以整段丢弃）——
 {{previous}}
 
 —— 最近的对话（第 {{from}}-{{to}} 楼）——
@@ -87,6 +104,7 @@ export const DEFAULT_SETTINGS = {
     includeSpeakerNames: true,  // 转录里是否带「角色名: 」前缀
     // 摘要
     promptWords: 200,
+    skeletonWords: 120,         // 骨架独立目标长度：它每回合都注入，必须比节点短
     prompt: DEFAULT_PROMPT,
     skeletonPrompt: DEFAULT_SKELETON_PROMPT,
     promptVersion: DEFAULT_PROMPT_VERSION,
@@ -113,6 +131,7 @@ export const SETTINGS_META = {
     },
     includeSpeakerNames: { type: 'boolean', label: '转录里带发言人名', hint: '关闭后只留正文，摘要会更难分辨谁在说话，但更省 token' },
     promptWords: { type: 'number', min: 30, max: 1000, step: 10, label: '摘要目标长度（字）', hint: '替换提示词里的 {{words}}；同时用于长度告警' },
+    skeletonWords: { type: 'number', min: 20, max: 1000, step: 10, label: '骨架目标长度（字）', hint: '替换骨架提示词里的 {{skeletonWords}}。骨架每回合都注入，建议明显小于节点' },
     skipWIAN: { type: 'boolean', label: '摘要时不带世界书与作者注', hint: '省 token，并且避免记忆条目自己触发自己' },
     nodeTokenCap: { type: 'number', min: 50, max: 1000, step: 10, label: '单条节点上限（token）', hint: '超出会在面板标红' },
     skeletonTokenCap: { type: 'number', min: 50, max: 2000, step: 10, label: '骨架条目上限（token）', hint: '' },
@@ -169,9 +188,47 @@ export function normalizeSettings(raw) {
     return out;
 }
 
-/** 历史默认提示词：用于判断"用户这份是不是没改过的旧默认值"（新默认值发布时把旧的塞进来） */
-const HISTORIC_DEFAULT_PROMPTS = new Set([]);
-const HISTORIC_SKELETON_PROMPTS = new Set([]);
+/**
+ * 历史默认提示词：用于判断"用户这份是不是没改过的旧默认值"（新默认值发布时把旧的塞进来）。
+ *
+ * v2 升级把两份默认提示词都换了（骨架：改成 4 行模板 + 禁令；节点：关键词判据可机械执行 + tier）。
+ * 只有**逐字等于这里的旧默认值**的那份才会被替换 —— 用户自己改过的一个字都不动。
+ */
+export const HISTORIC_DEFAULT_PROMPTS = new Set([`你在为一段角色扮演聊天做「记忆归档」。把下面的聊天记录压缩成一条结构化记忆节点。
+
+要求：
+- 只记录**已经发生的事实**，不要推测、不要续写、不要评价。
+- 正文用五个固定小标题组织：发生了什么 / 谁在场 / 状态变化 / 未结钩子 / 关键设定。
+- 正文总长不超过 {{words}} 个字。
+- 关键词给 3–8 个，必须是**专有名词或独特称谓**（地名、物品、组织、事件、称谓、别名）。
+  禁止使用主角名与用户名——ST 会把发言人名拼进扫描文本，用主角名做关键词等于每回合必中；
+  也禁止「剑」「人」「这里」这类高频词。宁可少给，也不要给会误触发的词。
+
+只输出一个 JSON 对象，不要解释、不要代码围栏：
+{"title":"不超过14个字的短标题","keywords":["关键词"],"summary":"结构化正文"}
+
+—— 聊天记录开始（共 {{count}} 条，第 {{from}}-{{to}} 楼）——
+{{messages}}
+—— 聊天记录结束 ——`]);
+
+export const HISTORIC_SKELETON_PROMPTS = new Set([`你在维护一张「现状卡」。它是这本记忆之书里唯一常驻注入的条目，
+作用是让模型随时知道"现在是什么局面"。
+
+输入是上一版现状卡（可能为空）和最近的对话记录。
+
+要求：
+- 输出**当前状态**，不是历史流水。已经过时的信息要删掉，不要越写越长。
+- 上一版里"未结钩子"中、这段对话没有解决的，必须原样保留下来。
+- 正文总长不超过 {{words}} 个字。
+- 用四个固定小节：当前阶段 / 在场人物 / 状态变化 / 未结钩子。
+
+只输出正文本身，不要 JSON、不要解释、不要代码围栏。
+
+—— 上一版现状卡 ——
+{{previous}}
+
+—— 最近的对话（第 {{from}}-{{to}} 楼）——
+{{messages}}`]);
 
 /** 用户有没有改过提示词 */
 export function isCustomPrompt(settings) {
@@ -336,12 +393,12 @@ export function extractKeywordsHeuristic(text, opts = {}) {
  *
  * @param {string} raw 模型原始输出
  * @param {{exclude?:string[]}} opts
- * @returns {{ok:boolean, format:'json'|'text'|'empty', title:string, keywords:string[], summary:string, degraded:boolean}}
+ * @returns {{ok:boolean, format:'json'|'text'|'empty', title:string, tier:string, keywords:string[], summary:string, degraded:boolean}}
  */
 export function parseSummaryOutput(raw, opts = {}) {
     const text = stripCodeFence(raw);
     if (!text) {
-        return { ok: false, format: 'empty', title: '', keywords: [], summary: '', degraded: false };
+        return { ok: false, format: 'empty', title: '', tier: 'side', keywords: [], summary: '', degraded: false };
     }
 
     const a = text.indexOf('{');
@@ -355,11 +412,15 @@ export function parseSummaryOutput(raw, opts = {}) {
             const keywords = Array.isArray(obj.keywords)
                 ? obj.keywords.map(String).map(s => s.trim()).filter(Boolean).slice(0, 8)
                 : [];
+            // tier 由模型建议，但只接受白名单里的值；模型不说就退化成 side（FR-15 的阶梯靠它）
+            const rawTier = String(obj.tier ?? '').trim().toLowerCase();
+            const tier = ['main', 'side', 'detail'].includes(rawTier) ? rawTier : 'side';
             if (summary || keywords.length) {
                 return {
                     ok: !!summary,
                     format: 'json',
                     title: title || firstLineTitle(summary),
+                    tier,
                     keywords,
                     summary: summary || text,
                     degraded: false,
@@ -374,6 +435,7 @@ export function parseSummaryOutput(raw, opts = {}) {
         ok: true,
         format: 'text',
         title: firstLineTitle(summary),
+        tier: 'side',
         keywords: extractKeywordsHeuristic(summary, opts),
         summary,
         degraded: true,
