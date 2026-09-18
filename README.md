@@ -272,7 +272,7 @@ SillyTavern-LoreMemory/
 | `repro-welcome.mjs` | 3 次刷新 | 专测「停在欢迎屏反复新建空书」这个真实 bug：修复后 `LM-*` 书数量恒定不增长 |
 | `ui-parity.mjs` | — | 在**面板真实所在的位置**（`#extensions_settings` 内、按 ST 自己的方式打开抽屉）量：外层容器不画盒子、标题行与同级扩展逐项同款；窄视口下的媒体查询 |
 | `check-encoding.mjs` | 18 文件 + 32 选择器 | 全量文本文件是合法 UTF-8、无 U+FFFD；CSS 关键选择器齐全、大括号配平 |
-| `verify-remote.mjs` | 13 文件 | 远端 `dev` 每个 blob SHA 与本地逐一比对（证明远端跑的就是本地测过的那份） |
+| `verify-remote.mjs` | 14 文件 | 远端 `dev` 每个 blob SHA 与本地逐一比对（证明远端跑的就是本地测过的那份） |
 | `screenshot.mjs` | — | 整屏 / 移动端截图（辅助出图，不参与判定） |
 
 `driver.mjs` 在**独立数据目录的实验室 ST 实例**（端口 8011）上跑，不碰你日常用的 ST 数据。
