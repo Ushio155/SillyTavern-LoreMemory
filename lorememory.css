@@ -8,16 +8,20 @@
  *  - 窄屏不要用 100vw（滚动条宽度会被重复计算）
  */
 
+/* 这一层只是**作用域容器**（下面所有规则都用它做前缀），本身不画任何东西。
+ *
+ * 以前这里还带 border + 底色 + 圆角 + 10px 内边距，结果是整个插件被套进一个深色方框里，
+ * 跟上面那些扩展完全不是一个形状；而且标题行被内边距顶窄了 20px（实测 561 vs 583），
+ * 和同级扩展的左边缘对不齐。
+ *
+ * ST 的扩展列表里，「一块扩展」的样子**只有那一行标题**：
+ *   #extensions_settings .inline-drawer-toggle.inline-drawer-header   ← style.css:5395
+ * 外面没有任何容器。所以这里一个像素都不该加。 */
 .lm-settings-block {
     --lm-ok: #4caf7d;
     --lm-warn: #f2c94c;
     --lm-bad: #d94b4b;
     --lm-key: #6ea8fe;
-    border: 1px solid var(--SmartThemeBorderColor, #555);
-    border-radius: 8px;
-    padding: 10px;
-    margin-bottom: 8px;
-    background: var(--SmartThemeBlurTintColor, rgba(0, 0, 0, 0.2));
     color: var(--SmartThemeBodyColor, #ddd);
     /* 用 1em 而不是 0.95em：面板里还要再套 0.85em / 0.74em 的标签与提示，
        基数一小就会层层缩到看不清（实测在这一档上标签已经很吃力）。 */
@@ -30,9 +34,11 @@
 }
 
 /* ── 外层折叠块标题（收起时唯一可见的部分） ── */
+/* 字号故意**不放大**：同级扩展的标题就是 body 字号 + 加粗（Larson 那种），
+   我们靠加粗 + 图标 + 徽标来区分，而不是把整个标题撑大 —— 一撑大，
+   和上面那些扩展并排看就"不是一路货"了。 */
 .lm-root-name {
     font-weight: 700;
-    font-size: 1.05em;
     white-space: nowrap;
 }
 
@@ -328,12 +334,12 @@
     margin-top: 0;
 }
 
-/* 外层标题：略大一点，底下一条线把标题和内容分开 —— 和 ST 内置扩展的区块标题同观感 */
-.lm-settings-block .lm-root-drawer > .inline-drawer-toggle.inline-drawer-header {
-    padding: 2px 2px 8px;
-    border-bottom: 1px solid rgba(127, 127, 127, 0.25);
-    font-size: 1.04em;
-}
+/* 外层标题：
+ * 这里**故意什么都不改**。标题行的高度、内边距、圆角、边框、底色全部交给主题/ST
+ * （`#extensions_settings .inline-drawer-toggle.inline-drawer-header`，选择器里带 id，
+ * 权重 (1,2,0)，我们任何纯 class 写法都盖不过它 —— 以前写的 padding / border-bottom
+ * 其实是死代码，实测计算值仍是主题的 9px 13px / 2px）。要让插件跟同级扩展长得一样，
+ * 唯一正确的做法就是别插手。 */
 
 /* 子区块整体缩进一级，让「谁在谁里面」一眼可见（含它们的分隔线一起缩进） */
 .lm-settings-block .lm-root-drawer > .inline-drawer-content > .inline-drawer {
@@ -523,7 +529,9 @@
 
 /* ── 移动端 ── */
 @media (max-width: 640px) {
-    .lm-settings-block { font-size: 0.95em; padding: 8px; }
+    /* 窄屏整体缩一档字：面板信息密度高，不缩会溢出。
+       这里同样**不加内边距** —— 内边距会把标题行顶窄，和上面的扩展对不齐。 */
+    .lm-settings-block { font-size: 0.95em; }
 
     /* 按钮两行等宽铺满（沿用 CardLore 的布局不变量） */
     .lm-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
