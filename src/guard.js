@@ -21,6 +21,34 @@
 export const SKELETON_FIELDS = ['当前阶段', '在场', '状态变化', '未结钩子'];
 
 /**
+ * 字段别名 —— 模型很爱换说法（"当前状态""在场人物""伏笔"…）。
+ * 不认别名的话，一份**内容完全正确**的卡会因为标签不同被整张拒收：
+ * 这是我们自己的模板要求太窄，不该由用户承担。
+ * 匹配时**先精确名、再按别名长度降序**，避免「状态」抢走「状态变化」。
+ */
+export const SKELETON_ALIASES = {
+    当前阶段: ['当前状态', '现状', '当前局面', '局面', '阶段'],
+    在场: ['在场人物', '在场者', '人物', '角色'],
+    状态变化: ['状态更新', '变化', '状态'],
+    未结钩子: ['未结伏笔', '未解钩子', '钩子', '伏笔', '悬念', '未结'],
+};
+
+/** 别名 → 标准字段名（含标准名自身） */
+export function canonicalField(name, fields = SKELETON_FIELDS, aliases = SKELETON_ALIASES) {
+    const raw = String(name ?? '').trim();
+    if (fields.includes(raw)) return raw;
+    const pairs = [];
+    for (const f of fields) {
+        for (const a of (aliases[f] || [])) pairs.push([a, f]);
+    }
+    pairs.sort((x, y) => y[0].length - x[0].length);   // 长的先匹配
+    for (const [alias, field] of pairs) {
+        if (raw === alias) return field;
+    }
+    return null;
+}
+
+/**
  * 裁剪优先级：越靠前越先被牺牲。
  * 「当前阶段」不在名单里 —— 一张不知道当下在哪的现状卡没有意义，它只允许被截断，不允许被丢。
  */
@@ -47,9 +75,9 @@ export function stripFence(text) {
 function parseFieldLine(line, fields) {
     const m = /^[\s>#*\-–—•【\[（(]*([^：:]{1,10}?)[\s】\]）)]*[：:]\s*([\s\S]*)$/.exec(line);
     if (!m) return null;
-    const name = m[1].trim();
-    if (!fields.includes(name)) return null;
-    return { field: name, body: m[2].trim().replace(/[\s。；;]+$/, '') };
+    const field = canonicalField(m[1].trim(), fields);
+    if (!field) return null;
+    return { field, body: m[2].trim().replace(/[\s。；;]+$/, '') };
 }
 
 /**
@@ -85,14 +113,23 @@ export function parseSkeleton(text, fields = SKELETON_FIELDS) {
 
 /** 行内切分：按字段标记把一行拆成多段，正文止于下一个字段标记 */
 function splitInline(line, fields) {
-    const re = new RegExp(`(${fields.join('|')})\\s*[：:]`, 'g');
+    // 别名也参与切分，且**长的排前面**，否则「状态」会抢走「状态变化」
+    const names = [];
+    for (const f of fields) {
+        names.push(f);
+        for (const a of (SKELETON_ALIASES[f] || [])) names.push(a);
+    }
+    names.sort((a, b) => b.length - a.length);
+    const re = new RegExp(`(${names.join('|')})\\s*[：:]`, 'g');
     const marks = [...line.matchAll(re)];
     if (marks.length < 2) return [];
     const out = [];
     for (let i = 0; i < marks.length; i++) {
+        const field = canonicalField(marks[i][1], fields);
+        if (!field) continue;
         const start = marks[i].index + marks[i][0].length;
         const end = i + 1 < marks.length ? marks[i + 1].index : line.length;
-        out.push({ field: marks[i][1], body: line.slice(start, end).trim().replace(/[\s。；;]+$/, '') });
+        out.push({ field, body: line.slice(start, end).trim().replace(/[\s。；;]+$/, '') });
     }
     return out;
 }

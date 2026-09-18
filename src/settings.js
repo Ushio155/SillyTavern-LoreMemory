@@ -105,6 +105,7 @@ export const DEFAULT_SETTINGS = {
     // 摘要
     promptWords: 200,
     skeletonWords: 120,         // 骨架独立目标长度：它每回合都注入，必须比节点短
+    transcriptTokens: 2000,     // 单次生成读入的记录上限（token）—— 见 fitTranscriptByTokens 的事故说明
     prompt: DEFAULT_PROMPT,
     skeletonPrompt: DEFAULT_SKELETON_PROMPT,
     promptVersion: DEFAULT_PROMPT_VERSION,
@@ -132,6 +133,7 @@ export const SETTINGS_META = {
     includeSpeakerNames: { type: 'boolean', label: '转录里带发言人名', hint: '关闭后只留正文，摘要会更难分辨谁在说话，但更省 token' },
     promptWords: { type: 'number', min: 30, max: 1000, step: 10, label: '摘要目标长度（字）', hint: '替换提示词里的 {{words}}；同时用于长度告警' },
     skeletonWords: { type: 'number', min: 20, max: 1000, step: 10, label: '骨架目标长度（字）', hint: '替换骨架提示词里的 {{skeletonWords}}。骨架每回合都注入，建议明显小于节点' },
+    transcriptTokens: { type: 'number', min: 300, max: 100000, step: 100, label: '单次生成读入的记录上限（token）', hint: '拼进提示词的聊天记录上限。太大就会顶爆上下文（界面报「必要的提示词超过了上下文大小」）；骨架取最新的若干楼，节点摘要从最旧那头取满一块、剩下的下次继续' },
     skipWIAN: { type: 'boolean', label: '摘要时不带世界书与作者注', hint: '省 token，并且避免记忆条目自己触发自己' },
     nodeTokenCap: { type: 'number', min: 50, max: 1000, step: 10, label: '单条节点上限（token）', hint: '超出会在面板标红' },
     skeletonTokenCap: { type: 'number', min: 50, max: 2000, step: 10, label: '骨架条目上限（token）', hint: '' },
@@ -281,6 +283,105 @@ export function buildTranscript(messages, opts = {}) {
     });
 
     return { text: lines.join('\n'), used: lines.length, skipped };
+}
+
+/**
+ * 按 **token 预算**挑选要读入的消息，再交给 buildTranscript 拼文本。
+ *
+ * 为什么必须有这一层（真实事故）：插件的 `{{messages}}` 是**塞进提示词正文**的，
+ * 而 ST 把 quietPrompt 当成一条**"必需"消息** —— 普通聊天历史超预算会被优雅丢弃，
+ * 必需消息塞不下则直接抛 TokenBudgetExceededError，界面上就是
+ * 「必要的提示词超过了上下文大小」。
+ * 实测现场：`openai_max_context=16000`、`openai_max_tokens=4000`（可用预算 12000），
+ * 而那条聊天 **223 楼、最后 40 楼 = 10,413 字 ≈ 7,706 token**，
+ * 40 楼窗口把预算吃掉大半，角色卡+系统提示词再一挤就炸 —— **每次点刷新都炸**。
+ *
+ * 两种取法，因为两种用途要的东西不同：
+ *  · `fromOldest: false`（骨架）—— 取**最新**的若干楼：骨架要的是"现在"
+ *  · `fromOldest: true`（节点摘要）—— 从**最旧**那头取满一块：游标只推进到这块末尾，
+ *    剩下的下次继续，既不丢历史也不会一次塞爆
+ *
+ * @param {Array} messages 候选消息
+ * @param {{maxTokens:number, estimate:(t:string)=>number, fromOldest?:boolean,
+ *          scope?:string, includeSpeakerNames?:boolean, startIndex?:number}} opts
+ * @returns {{text:string, used:number, skipped:number,
+ *            from:number, to:number, total:number, droppedByBudget:number}}
+ *          from/to 是**相对于传入数组**的 0 基闭区间；总量为 0 时 from=0,to=-1
+ */
+export function fitTranscriptByTokens(messages, opts = {}) {
+    const list = Array.isArray(messages) ? messages : [];
+    const total = list.length;
+    const estimate = typeof opts.estimate === 'function'
+        ? opts.estimate
+        : (t => Math.ceil(String(t ?? '').length / 1.2));
+    const maxTokens = Number(opts.maxTokens) > 0 ? Number(opts.maxTokens) : 0;
+    const startIndex = Number.isFinite(opts.startIndex) ? opts.startIndex : 0;
+
+    const empty = { text: '', used: 0, skipped: 0, from: 0, to: -1, total, droppedByBudget: 0 };
+    if (!total) return empty;
+
+    // 单条消息的估算开销（含 [楼号] 名字: 前缀的粗略量级）
+    const cost = (m) => {
+        const body = String(m?.mes ?? '').trim();
+        const who = String(m?.name || (m?.is_user ? 'User' : 'Char'));
+        return estimate(`[0000] ${who}: ${body}`);
+    };
+
+    let from = 0;
+    let to = total - 1;
+
+    if (maxTokens > 0) {
+        let acc = 0;
+        if (opts.fromOldest) {
+            let end = -1;
+            for (let i = 0; i < total; i++) {
+                const c = cost(list[i]);
+                if (end >= 0 && acc + c > maxTokens) break;   // 至少留一条，避免预算过小时空转
+                acc += c;
+                end = i;
+            }
+            to = end < 0 ? 0 : end;
+        } else {
+            let start = total;
+            for (let i = total - 1; i >= 0; i--) {
+                const c = cost(list[i]);
+                if (start < total && acc + c > maxTokens) break;
+                acc += c;
+                start = i;
+            }
+            from = start >= total ? total - 1 : start;
+        }
+    }
+
+    const built = buildTranscript(list.slice(from, to + 1), {
+        scope: opts.scope,
+        includeSpeakerNames: opts.includeSpeakerNames,
+        startIndex: startIndex + from,
+    });
+
+    return {
+        text: built.text,
+        used: built.used,
+        skipped: built.skipped,
+        from,
+        to,
+        total,
+        droppedByBudget: total - (to - from + 1),
+    };
+}
+
+/**
+ * 预算夹取：用户设定 vs ST 的真实可用预算。
+ * 留一半给角色卡 / 系统提示词 / 世界书 / 回复，另一半给记录 —— 记录是这几项里最容易失控的。
+ * @param {number} wanted 用户设定值
+ * @param {number} maxPromptTokens ST 的可用提示词预算（拿不到就传 0）
+ */
+export function clampTranscriptTokens(wanted, maxPromptTokens) {
+    const want = Number(wanted) > 0 ? Number(wanted) : 0;
+    const budget = Number(maxPromptTokens) > 0 ? Number(maxPromptTokens) : 0;
+    const hard = budget > 0 ? Math.floor(budget * 0.5) : 0;
+    const value = hard > 0 ? Math.min(want, hard) : want;
+    return Math.max(300, value);
 }
 
 /** 还没被总结的消息条数 */

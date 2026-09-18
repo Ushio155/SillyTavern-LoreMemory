@@ -21,6 +21,8 @@ import {
     extension_prompt_types,
     extension_prompt_roles,
     saveSettingsDebounced,
+    getMaxPromptTokens,
+    max_context,
 } from '../../../../script.js';
 import { extension_settings, getContext } from '../../../extensions.js';
 import { eventSource, event_types } from '../../../events.js';
@@ -40,6 +42,7 @@ import {
 import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.js';
 import { SlashCommand } from '../../../slash-commands/SlashCommand.js';
 import { ARGUMENT_TYPE, SlashCommandArgument } from '../../../slash-commands/SlashCommandArgument.js';
+import { oai_settings } from '../../../../scripts/openai.js';
 
 import { estimateTokens } from './src/tokens.js';
 import { enforceSkeleton, SKELETON_FIELDS } from './src/guard.js';
@@ -65,6 +68,8 @@ import {
     shouldRefreshSkeleton,
     parseSummaryOutput,
     extractKeywordsHeuristic,
+    fitTranscriptByTokens,
+    clampTranscriptTokens,
 } from './src/settings.js';
 import { renderPanel, escapeHtml } from './src/ui.js';
 import { isRealChatContext, noChatReason } from './src/context.js';
@@ -76,6 +81,32 @@ const PANEL_ID = 'lm_panel_root';
 /** 骨架刷新时最多回看多少条消息（避免骨架提示词爆上下文） */
 const SKELETON_LOOKBACK = 40;
 
+/**
+ * ST 侧的真实可用提示词预算（token）：上下文 − 回复预留，且按当前 API 自动取值。
+ * 拿不到就退回 OpenAI 源的设置，再退回 max_context，最后给一个保守值。
+ *
+ * 为什么一定要问 ST：我们的 `{{messages}}` 是拼进提示词正文的，而 quietPrompt 在 ST 里
+ * 属于**必需消息**，超预算不会被丢弃、而是直接抛 TokenBudgetExceededError
+ * （界面：「必要的提示词超过了上下文大小」）。
+ */
+function maxPromptTokenBudget() {
+    try {
+        const n = Number(getMaxPromptTokens());
+        if (Number.isFinite(n) && n > 0) return n;
+    } catch { /* 宿主 API 变化时不要崩 */ }
+    try {
+        const ctx = Number(oai_settings?.openai_max_context) || Number(max_context) || 0;
+        const out = Number(oai_settings?.openai_max_tokens) || 0;
+        if (ctx > 0) return Math.max(1, ctx - out);
+    } catch { /* ignore */ }
+    return 8192;
+}
+
+/** 本次生成允许读入多少 token 的聊天记录（用户设定 + ST 预算夹取） */
+function transcriptBudgetTokens() {
+    return clampTranscriptTokens(getSettings().transcriptTokens, maxPromptTokenBudget());
+}
+
 /** 我们的聊天世界书统一用这个前缀命名（「清理空书」也靠它识别） */
 const BOOK_PREFIX = 'LM-';
 
@@ -83,6 +114,33 @@ const BOOK_PREFIX = 'LM-';
 
 /** 正在跑 quiet 摘要：此期间的世界书扫描不记账（否则插件自己的请求会把账本刷成空） */
 let summarizing = false;
+/** 上面那次生成是什么时候开始的（用于卡死判定） */
+let summarizingSince = 0;
+/** 单次生成的硬超时：到点就放弃等待（ST 的 generateQuietPrompt 不支持取消，只能不等它） */
+const QUIET_TIMEOUT_MS = 90000;
+/** 超过这么久还没回来，判定为卡死并复位 */
+const SUMMARIZING_STALE_MS = 150000;
+
+/**
+ * 「正在生成吗」的唯一入口 —— 不要直接读 `summarizing` 这个裸布尔。
+ *
+ * 为什么（真实事故）：`onScanDone` 里 `if (summarizing) return` 是"插件自己的摘要请求不记账"，
+ * 但如果某次生成**永远不返回**（API 无响应、流式卡住、代理挂起），这个布尔会一直为 true：
+ *  · 记账被**永久关掉** —— 面板「本回合注入了什么」从此永远空白，且没有任何报错；
+ *  · 后续自动总结也再也不会启动。
+ * driver 的账本断言连续两次全空，诊断出 `summarizing: true` 卡死，才定位到这里。
+ * 所以每次询问都带一次卡死检查：超时即复位，让插件自己恢复。
+ */
+function isSummarizing() {
+    if (!summarizing) return false;
+    if (Date.now() - summarizingSince > SUMMARIZING_STALE_MS) {
+        console.warn(`[LoreMemory] 上一次生成超过 ${Math.round(SUMMARIZING_STALE_MS / 1000)} 秒没有返回，判定为卡死并复位（否则记账会一直被关掉）`);
+        summarizing = false;
+        summarizingSince = 0;
+        return false;
+    }
+    return true;
+}
 /** 本回合被手动钉选的 uid，仅用于账本里标注"钉选" */
 const forcedUids = new Set();
 /** 本回合是否有 /lm-recall 塞过关键词，扫描后清掉 */
@@ -359,12 +417,37 @@ function upsertSkeletonRecord(state, content, status = 'active') {
 
 // ───────────────────────── LLM 摘要（FR-2/3/4） ─────────────────────────
 
-/** 取「本次要总结」的区间（0 基、闭区间） */
+/**
+ * 取「本次要总结」的区间（0 基、闭区间）。
+ *
+ * 除了游标，还受 **token 预算**约束：一次只吃"从最旧那头装满的一块"，
+ * 游标推进到这块末尾，剩下的下次继续 —— 既不丢历史，也不会把提示词塞爆
+ * （历史 223 楼的聊天，整段塞进一条必需消息就是 TokenBudgetExceededError）。
+ */
 function pendingRange(state) {
+    const settings = getSettings();
     const chat = chatMessages();
     const from = Math.max(0, Number(state.cursor) || 0);
     const to = chat.length - 1;
-    return { from, to, empty: to < from };
+    if (to < from) return { from, to, empty: true, chunked: false, droppedByBudget: 0 };
+
+    const fit = fitTranscriptByTokens(chat.slice(from, to + 1), {
+        maxTokens: transcriptBudgetTokens(),
+        estimate: estimateTokens,
+        fromOldest: true,
+        scope: settings.scanScope,
+        includeSpeakerNames: settings.includeSpeakerNames,
+        startIndex: from,
+    });
+    const cappedTo = from + fit.to;
+    return {
+        from,
+        to: cappedTo,
+        empty: false,
+        fullTo: to,
+        chunked: cappedTo < to,
+        droppedByBudget: fit.droppedByBudget,
+    };
 }
 
 /** 把一段区间按当前设置拼成转录文本 */
@@ -398,15 +481,27 @@ function promptVars(text, count, from, to) {
 async function callLlm(prompt) {
     const settings = getSettings();
     summarizing = true;
+    summarizingSince = Date.now();
+    let timer = null;
     try {
-        const raw = await generateQuietPrompt({
-            quietPrompt: prompt,
-            skipWIAN: !!settings.skipWIAN,
-            removeReasoning: true,
-        });
+        // 硬超时：卡住的生成不能把记账和后续总结一起拖死（见 isSummarizing 的事故说明）
+        const raw = await Promise.race([
+            generateQuietPrompt({
+                quietPrompt: prompt,
+                skipWIAN: !!settings.skipWIAN,
+                removeReasoning: true,
+            }),
+            new Promise((_, reject) => {
+                timer = setTimeout(
+                    () => reject(new Error(`生成超过 ${Math.round(QUIET_TIMEOUT_MS / 1000)} 秒没有返回，已放弃等待（ST 不支持取消，后台可能仍在跑）`)),
+                    QUIET_TIMEOUT_MS);
+            }),
+        ]);
         return String(raw ?? '');
     } finally {
+        if (timer) clearTimeout(timer);
         summarizing = false;
+        summarizingSince = 0;
     }
 }
 
@@ -521,7 +616,7 @@ async function applyNodeOutput(raw, from, to) {
  * @param {{manual?:boolean}} opts manual=true 时所有失败都会 toast 出来
  */
 async function summarizePending({ manual = false } = {}) {
-    if (summarizing) {
+    if (isSummarizing()) {
         if (manual) toast('已有一次总结在进行中，请稍候', 'info');
         return { ok: false, reason: 'busy' };
     }
@@ -530,10 +625,15 @@ async function summarizePending({ manual = false } = {}) {
     if (!r.ok) { if (manual) toast(r.reason, 'warning'); return r; }
     const state = r.state;
 
-    const { from, to, empty } = pendingRange(state);
+    const range = pendingRange(state);
+    const { from, to, empty } = range;
     if (empty) {
         if (manual) toast('没有未总结的消息', 'info');
         return { ok: false, reason: 'nothing-pending' };
+    }
+    if (range.chunked) {
+        // 让用户知道"为什么只总结了这几楼"，否则会以为插件漏了历史
+        toast(`本次只总结第 ${from + 1}-${to + 1} 楼（记录上限 ${transcriptBudgetTokens()} token），剩余 ${range.droppedByBudget} 楼下次继续`, 'info');
     }
 
     const built = buildNodePrompt(from, to);
@@ -577,8 +677,20 @@ async function refreshSkeleton(state, { manual = false } = {}) {
     const wasDisabled = prevRec && prevRec.status === 'disabled';
     if (wasDisabled && !manual) return { ok: false, reason: 'skeleton-disabled' };
 
-    const from = Math.max(0, chat.length - SKELETON_LOOKBACK);
-    const { text, used } = transcriptFor(from, chat.length - 1, settings);
+    // 回看窗口：先按条数取最近 40 条，再按 **token 预算**从最新那头裁
+    // （骨架要的是"现在"，所以丢的是最旧的；实测 40 楼可达 7,700 token，足以顶爆上下文）
+    const windowStart = Math.max(0, chat.length - SKELETON_LOOKBACK);
+    const fit = fitTranscriptByTokens(chat.slice(windowStart), {
+        maxTokens: transcriptBudgetTokens(),
+        estimate: estimateTokens,
+        fromOldest: false,
+        scope: settings.scanScope,
+        includeSpeakerNames: settings.includeSpeakerNames,
+        startIndex: windowStart,
+    });
+    const text = fit.text;
+    const used = fit.used;
+    const from = windowStart + fit.from;
     if (!used) { if (manual) toast('最近的消息按当前扫描范围被全部过滤，骨架未刷新', 'warning'); return { ok: false }; }
 
     const previous = (state.nodes.find(n => n.id === 'SKEL') || {}).content || '（无）';
@@ -605,6 +717,13 @@ async function refreshSkeleton(state, { manual = false } = {}) {
     });
 
     if (!gate.ok) {
+        // 先区分"模型什么都没返回"和"返回了但没按模板" —— 前者的真因通常是上下文预算不够
+        // 或 API 报错（ST 会弹「必要的提示词超过了上下文大小」）。报成"没按模板写"
+        // 会把用户引到完全错误的方向：真实事故里每点一次刷新都报上下文超限。
+        if (!gate.rawChars) {
+            toast('骨架没有返回任何内容 —— 通常是上下文预算不够或 API 报错（详情见浏览器控制台）', 'warning');
+            return { ok: false, reason: 'empty-output', rawTokens: 0 };
+        }
         // 结构完全不合法（例如整段写成小说、一个状态字段都没有）：保留上一版，不写入垃圾
         toast(`骨架输出里没有任何状态字段，已保留原卡（模型没按模板写，原始输出 ${gate.rawTokens} token）`, 'warning');
         return { ok: false, reason: gate.reason, rawTokens: gate.rawTokens };
@@ -627,7 +746,7 @@ async function refreshSkeleton(state, { manual = false } = {}) {
 /** 用当前提示词重新总结某个已有节点（保持 uid 不变） */
 async function resummarizeNode(state, node) {
     if (!node || node.id === 'SKEL') { toast('骨架请用「刷新骨架」', 'warning'); return; }
-    if (summarizing) { toast('已有一次总结在进行中', 'info'); return; }
+    if (isSummarizing()) { toast('已有一次总结在进行中', 'info'); return; }
 
     const settings = getSettings();
     const chat = chatMessages();
@@ -635,8 +754,21 @@ async function resummarizeNode(state, node) {
     const to = Math.min(chat.length - 1, node.to - 1);
     if (to < from) { toast('这个节点的区间已经不在聊天里了', 'warning'); return; }
 
-    const { text, used } = transcriptFor(from, to, settings);
+    // 同样受 token 预算约束（防御性：历史节点可能是早期无分块时生成的超长区间）
+    const fit = fitTranscriptByTokens(chat.slice(from, to + 1), {
+        maxTokens: transcriptBudgetTokens(),
+        estimate: estimateTokens,
+        fromOldest: false,
+        scope: settings.scanScope,
+        includeSpeakerNames: settings.includeSpeakerNames,
+        startIndex: from,
+    });
+    const text = fit.text;
+    const used = fit.used;
     if (!used) { toast('这个区间按当前扫描范围被全部过滤，无法重摘要', 'warning'); return; }
+    if (fit.droppedByBudget) {
+        toast(`这个区间有 ${fit.droppedByBudget} 楼超出记录上限，本次只重摘要最近的部分`, 'warning');
+    }
 
     const prompt = renderPrompt(settings.prompt, promptVars(text, used, from, to));
     let raw;
@@ -771,13 +903,13 @@ async function onChatChanged() {
  */
 function scheduleAutoWork() {
     const settings = getSettings();
-    if (!settings.autoMemory || summarizing) return;
+    if (!settings.autoMemory || isSummarizing()) return;
     if (autoTimer) return;   // 已经排队了，别重复排
 
     autoTimer = setTimeout(async () => {
         autoTimer = null;
         try {
-            if (!getSettings().autoMemory || summarizing) return;
+            if (!getSettings().autoMemory || isSummarizing()) return;
             const r = await ensureBook({ interactive: false });
             if (!r.ok) return;
             const state = r.state;
@@ -979,7 +1111,7 @@ function clearRecall() {
 // ───────────────────────── 账本（FR-9）：读 ST 的扫描结果 ─────────────────────────
 
 function onScanDone(args) {
-    if (summarizing) return;   // 插件自己的摘要请求不记账
+    if (isSummarizing()) return;   // 插件自己的摘要请求不记账
 
     const state = getState();
     if (!state || !state.bookName) return;
@@ -1510,8 +1642,13 @@ window.LoreMemory = {
     cleanupEmptyBooks, isRealChatContext,
     // 流水线分段：可以在不调模型的前提下验证"拼提示词"与"落库"两段
     buildNodePrompt, applyNodeOutput, pendingRange,
+    // 上下文预算：driver 用它断言"读入的记录真的被预算夹住了"
+    maxPromptTokenBudget, transcriptBudgetTokens,
     render, scheduleAutoWork,
     get bookReady() { return bookReady; },
-    get summarizing() { return summarizing; },
+    // 带卡死判定：卡住的生成会被复位，不会让"正在生成"永远为真
+    get summarizing() { return isSummarizing(); },
+    /** 卡死判定用：距离那次生成开始过了多久（毫秒） */
+    get summarizingForMs() { return summarizing ? Date.now() - summarizingSince : 0; },
     chat_metadata,
 };
