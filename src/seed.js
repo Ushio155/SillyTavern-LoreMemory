@@ -127,3 +127,76 @@ export function checkKeys(keys) {
     }
     return { level: messages.length ? 'warn' : 'ok', messages };
 }
+
+/** 判别力阈值：关键词在「本节点区间之外」的消息里出现率超过它 → 判为误触发源 */
+export const KEY_OUTSIDE_RATIO_MAX = 0.25;
+
+/** 全局出现率上限：超过它的词几乎每回合都在 → 与区间无关，一律判死 */
+export const KEY_OMNIPRESENT_RATIO_MAX = 0.5;
+
+/**
+ * 关键词判别力自检（FR-14 的第二层，来自真实案例）。
+ *
+ * 为什么 `checkKeys` 不够：它只看"这个词本身可不可疑"（1 个字 / 10 词黑名单），
+ * 而真实误触发是**统计事实** —— 有些词本身很正常，但在整条聊天里到处都是。
+ *
+ * 实测案例（41 楼真实聊天 + deepseek-flash）：14 个关键词里只有 2 个是元凶 ——
+ * 「敏感度」22/41 = **54%**、「淫乱度」20/41 = **49%**，其余 12 个多在 1/41。
+ * 这两个词被 N002/N003/N004 **共用**，于是任一出现就同时点亮三个节点
+ * = **367 token/回合**，与当前剧情完全无关。
+ * 根因：那张角色卡强制模型每回合输出含这两个词的数值块 ——
+ * "每回合都会出现的词"被当成了关键词。这与插件早就记过的教训
+ * （不要把主角名当关键词，因为发言人名每回合都在）是**同一类错误**，只是来源不同。
+ *
+ * 判据刻意用**区间外出现率**而不是全局出现率：一个词只要只在自己那段剧情里出现，
+ * 它就是好关键词 —— 例：「小夜灯」9/41，但全部落在 N004 的 32-41 楼 → 必须保留。
+ *
+ * @param {string[]} keys
+ * @param {Array<{mes?:string}>} messages
+ * @param {{from?:number, to?:number}} range 1 基闭区间（节点自己的楼层）
+ */
+export function keyStats(keys, messages, range) {
+    const list = (messages || []).filter(m => m && typeof m.mes === 'string');
+    const total = list.length;
+    const from = Math.max(1, Number(range && range.from) || 1);
+    const to = Math.min(total || 0, Number(range && range.to) || total);
+    const span = Math.max(0, to - from + 1);
+    const outsideTotal = Math.max(0, total - span);
+
+    return (keys || []).map(key => {
+        const k = String(key);
+        let all = 0;
+        let inside = 0;
+        list.forEach((m, i) => {
+            if (!m.mes.includes(k)) return;
+            all++;
+            if (i + 1 >= from && i + 1 <= to) inside++;
+        });
+        const outside = all - inside;
+        return {
+            key: k,
+            all, inside, outside, total, outsideTotal,
+            outsideRatio: outsideTotal ? outside / outsideTotal : 0,
+            allRatio: total ? all / total : 0,
+        };
+    });
+}
+
+/**
+ * 剔除判别力不足的关键词。
+ * @returns {{keep:string[], dropped:Array<{key:string,reason:'omnipresent'|'outside'}>, stats:Array}}
+ */
+export function dropIndiscriminativeKeys(keys, messages, range, opts = {}) {
+    const outsideMax = Number(opts.outsideRatioMax) || KEY_OUTSIDE_RATIO_MAX;
+    const omniMax = Number(opts.omnipresentRatioMax) || KEY_OMNIPRESENT_RATIO_MAX;
+
+    const stats = keyStats(keys, messages, range);
+    const keep = [];
+    const dropped = [];
+    for (const s of stats) {
+        if (s.allRatio >= omniMax) dropped.push({ ...s, reason: 'omnipresent' });
+        else if (s.outsideRatio >= outsideMax) dropped.push({ ...s, reason: 'outside' });
+        else keep.push(s.key);
+    }
+    return { keep, dropped, stats };
+}

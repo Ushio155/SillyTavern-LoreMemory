@@ -42,6 +42,7 @@ import { SlashCommand } from '../../../slash-commands/SlashCommand.js';
 import { ARGUMENT_TYPE, SlashCommandArgument } from '../../../slash-commands/SlashCommandArgument.js';
 
 import { estimateTokens } from './src/tokens.js';
+import { enforceSkeleton, SKELETON_FIELDS } from './src/guard.js';
 import {
     STATE_KEY,
     normalizeState,
@@ -51,7 +52,7 @@ import {
     recordTurn,
 } from './src/store.js';
 import { nodeEntryPatch, skeletonEntryPatch, inferReason } from './src/entry.js';
-import { DEMO_NODES, DEMO_SKELETON, checkKeys } from './src/seed.js';
+import { DEMO_NODES, DEMO_SKELETON, checkKeys, dropIndiscriminativeKeys } from './src/seed.js';
 import {
     normalizeSettings,
     DEFAULT_PROMPT,
@@ -313,6 +314,29 @@ async function writeSkeleton(state, content) {
     return uid;
 }
 
+/**
+ * 只重写骨架条目的字段与内容，**不推进** revision / skeletonAt。
+ *
+ * 为什么单独一个函数：「禁用 / 启用」不是一次"刷新"，不该改写 v3→v4，也不该重置
+ * 「距上次刷新多少楼」。但**必须**用 skeletonEntryPatch —— 走 writeNode 那条路会用
+ * 节点补丁把骨架降级（constant:false / position:before_char / 空关键词），
+ * 结果就是面板显示"已启用"、实际永远注入不了（真实案例里踩到过）。
+ */
+async function writeSkeletonEntryOnly(state, node) {
+    const settings = getSettings();
+    const revision = Number(state.skeletonRevision) || 1;
+    const patch = {
+        ...skeletonEntryPatch(settings, revision),
+        disable: node.status === 'disabled',
+    };
+    const content = String(node.content || '');
+    const uid = await saveEntry(state, node.uid ?? state.skeletonUid, patch, content);
+    node.uid = uid;
+    state.skeletonUid = uid;
+    node.tokens = estimateTokens(content);
+    return uid;
+}
+
 /** 骨架在节点列表里的展示记录 */
 function upsertSkeletonRecord(state, content) {
     const tokens = estimateTokens(content);
@@ -405,6 +429,29 @@ function buildNodePrompt(from, to) {
 }
 
 /**
+ * 关键词闸门 = 结构自检（`checkKeys`）+ **判别力自检**（`dropIndiscriminativeKeys`）。
+ *
+ * 判别力那一层用的是**本条聊天的真实消息** —— 这是提示词永远做不到的：
+ * 模型不可能知道一个词在整条聊天里的出现率。真实案例里被它拦下的正是
+ * 「敏感度」(54%) 和「淫乱度」(49%)，而其余 12 个关键词一个没动。
+ *
+ * @param {string[]} rawKeys 模型给的关键词
+ * @param {number} from 1 基起始楼号
+ * @param {number} to 1 基结束楼号
+ */
+function gateKeys(rawKeys, from, to) {
+    const keys = (rawKeys || []).slice(0, 8);
+    const structural = checkKeys(keys);
+    const disc = dropIndiscriminativeKeys(keys, chatMessages(), { from, to });
+    return {
+        keys: disc.keep,
+        dropped: disc.dropped,
+        structuralWarn: structural.messages,
+        structuralOk: structural.level !== 'warn',
+    };
+}
+
+/**
  * 把模型输出落成一个节点（写世界书 + 推进游标 + 刷新面板）。
  * 与"调模型"解耦，因此可以用任意模型输出直接驱动，验证解析/降级/落库全链路。
  *
@@ -417,10 +464,11 @@ async function applyNodeOutput(raw, from, to) {
     const parsed = parseSummaryOutput(raw, { exclude: [ctx.name1, ctx.name2].filter(Boolean) });
     if (!parsed.ok) return { ok: false, reason: 'empty-output' };
 
-    // 关键词质量把关（对应 FR-14）：不过关就写入但先禁用，保底不污染上下文
-    const keyCheck = checkKeys(parsed.keywords);
+    // 关键词闸门：结构自检 + 判别力自检（对应 FR-14）
+    const g = gateKeys(parsed.keywords, from + 1, to + 1);
     const degraded = parsed.degraded || !parsed.keywords.length;
-    const review = degraded || keyCheck.level === 'warn';
+    // 关键词被剔光 = 这个节点永远不会被召回 → 交给人工确认（面板里的「改关键词」）
+    const review = degraded || !g.structuralOk || g.keys.length === 0;
 
     const state = getState();
     const node = {
@@ -429,7 +477,8 @@ async function applyNodeOutput(raw, from, to) {
         from: from + 1,
         to: to + 1,
         title: parsed.title,
-        keys: parsed.keywords.slice(0, 8),
+        keys: g.keys,
+        droppedKeys: g.dropped.map(d => d.key),
         content: parsed.summary,
         tokens: 0,
         tier: 'side',
@@ -448,14 +497,19 @@ async function applyNodeOutput(raw, from, to) {
 
     const why = !parsed.keywords.length
         ? '关键词为空（提示词可能没有按要求输出 JSON）'
-        : (degraded ? '模型没有按 JSON 输出，已按纯文本处理并用兜底规则抽词' : (keyCheck.messages[0] || ''));
+        : (degraded ? '模型没有按 JSON 输出，已按纯文本处理并用兜底规则抽词'
+            : (g.dropped.length
+                ? `已剔除会误触发的关键词：${g.dropped.map(d => `${d.key}（${Math.round(d.allRatio * 100)}% 的消息里出现）`).join('、')}`
+                : (g.structuralWarn[0] || '')));
 
     if (review) {
-        toast(`节点 ${node.id} 已写入但标为「待确认」并暂时禁用：${why}。请到节点列表里改关键词后启用。`, 'warning');
+        toast(`节点 ${node.id} 已写入但标为「待确认」并暂时禁用：${why}。请在节点列表里点「改关键词」修好后启用。`, 'warning');
+    } else if (g.dropped.length) {
+        toast(`已生成节点 ${node.id}：${node.title}（${node.from}-${node.to}楼）。${why}`, 'info');
     } else {
         toast(`已生成节点 ${node.id}：${node.title}（${node.from}-${node.to}楼）`, 'success');
     }
-    return { ok: true, node, review, why, format: parsed.format };
+    return { ok: true, node, review, why, dropped: g.dropped, format: parsed.format };
 }
 
 /**
@@ -532,15 +586,33 @@ async function refreshSkeleton(state, { manual = false } = {}) {
         toast(`骨架刷新失败：${e?.message || e}`, 'error');
         return { ok: false };
     }
-    const content = raw.trim();
-    if (!content) { toast('骨架返回空内容，保持原样', 'warning'); return { ok: false }; }
+    // ── 硬闸门 ──
+    // 提示词只能"请求"模型守规矩，这里才"保证"：结构化过滤掉叙述体 + 按 skeletonTokenCap 裁剪。
+    // 实测教训（deepseek-flash）：要求 ≤200 字，实际输出 665 字，且整张卡是一篇小说。
+    const gate = enforceSkeleton(raw, {
+        tokenCap: Number(settings.skeletonTokenCap) || 350,
+        estimate: estimateTokens,
+        fields: SKELETON_FIELDS,
+    });
 
-    await writeSkeleton(state, content);
-    upsertSkeletonRecord(state, content);
+    if (!gate.ok) {
+        // 结构完全不合法（例如整段写成小说、一个状态字段都没有）：保留上一版，不写入垃圾
+        toast(`骨架输出里没有任何状态字段，已保留原卡（模型没按模板写，原始输出 ${gate.rawTokens} token）`, 'warning');
+        return { ok: false, reason: gate.reason, rawTokens: gate.rawTokens };
+    }
+
+    await writeSkeleton(state, gate.content);
+    upsertSkeletonRecord(state, gate.content);
     persist();
     render();
-    if (manual) toast('骨架现状卡已刷新', 'success');
-    return { ok: true };
+
+    if (gate.changed) {
+        const tail = gate.overCapRemain ? '，仍略超上限' : '';
+        toast(`骨架已整理：${gate.actions.join('；')}｜${gate.rawTokens} → ${gate.tokens} token${tail}`, 'info');
+    } else if (manual) {
+        toast('骨架现状卡已刷新', 'success');
+    }
+    return { ok: true, tokens: gate.tokens, actions: gate.actions };
 }
 
 /** 用当前提示词重新总结某个已有节点（保持 uid 不变） */
@@ -565,22 +637,59 @@ async function resummarizeNode(state, node) {
     const parsed = parseSummaryOutput(raw, { exclude: [ctx.name1, ctx.name2].filter(Boolean) });
     if (!parsed.ok) { toast('重摘要返回空内容', 'error'); return; }
 
-    const keyCheck = checkKeys(parsed.keywords);
+    const g = gateKeys(parsed.keywords, node.from, node.to);
     const degraded = parsed.degraded || !parsed.keywords.length;
 
     // 保留上一版正文，便于回溯（需求文档 FR-11「可撤销」）
     node.prevContent = node.content;
     node.title = parsed.title;
-    node.keys = parsed.keywords.slice(0, 8);
+    node.keys = g.keys;
+    node.droppedKeys = g.dropped.map(d => d.key);
     node.content = parsed.summary;
-    node.status = (degraded || keyCheck.level === 'warn') ? 'needs_review' : 'active';
+    node.status = (degraded || !g.structuralOk || g.keys.length === 0) ? 'needs_review' : 'active';
     node.source = 'llm';
 
     await writeNode(state, node);
     recountReview(state);
     persist();
     render();
-    toast(`已重新总结 ${node.id}（uid 未变，粘滞/冷却状态保留）`, 'success');
+    const extra = g.dropped.length ? `；已剔除误触发关键词 ${g.dropped.map(d => d.key).join('、')}` : '';
+    toast(`已重新总结 ${node.id}（uid 未变，粘滞/冷却状态保留）${extra}`, g.dropped.length ? 'info' : 'success');
+}
+
+/**
+ * 手工修改节点的关键词（F9：以前「待确认」节点**没有任何修词入口**，
+ * toast 和 README 却都在让用户"改关键词后启用" —— 那是一句空话）。
+ *
+ * 语义：手改即视为人工确认 —— 用户亲手写的词不再过判别力闸门（他看得见自己的聊天），
+ * 但关键词为空时条目永远不会被召回，仍标回「待确认」并明确告知。
+ */
+async function saveNodeKeys(uid, rawValue) {
+    const state = getState();
+    const node = nodeByUid(state, uid);
+    if (!node) return;
+    if (node.id === 'SKEL') { toast('骨架不用关键词（它靠 constant 常驻注入）', 'warning'); return; }
+
+    const keys = String(rawValue || '')
+        .split(/[,，、;；|\s]+/)
+        .map(s => s.trim())
+        .filter(Boolean)
+        .slice(0, 8);
+
+    node.keys = keys;
+    node.droppedKeys = [];   // 人工过目过了，撤掉"已自动剔除"的提示
+    if (keys.length) {
+        if (node.status === 'needs_review') node.status = 'active';
+    } else if (node.status === 'active') {
+        node.status = 'needs_review';
+    }
+
+    await writeNode(state, node);
+    recountReview(state);
+    persist();
+    render();
+    if (keys.length) toast(`${node.id} 关键词已更新：${keys.join('、')}`, 'success');
+    else toast(`${node.id} 关键词已清空 —— 该条目不会再被召回，已标为「待确认」`, 'warning');
 }
 
 function recountReview(state) {
@@ -944,7 +1053,13 @@ function onPanelSettingInput(ev) {
 }
 
 /** 勾选框 / 下拉框 / 数字框：改完重绘，让「未总结 / 阈值」等派生显示立刻跟上 */
-function onPanelSettingChange(ev) {
+async function onPanelSettingChange(ev) {
+    // 节点关键词输入框（F9）：change 在失焦/回车时触发，改完直接落盘并重绘 chip
+    const keysEl = ev.target.closest('[data-lm-keys]');
+    if (keysEl) {
+        await saveNodeKeys(Number(keysEl.dataset.lmKeys), keysEl.value);
+        return;
+    }
     const el = ev.target.closest('[data-lm-setting]');
     if (!el) return;
     if (el.tagName === 'TEXTAREA') return;
@@ -1000,7 +1115,10 @@ async function onPanelClick(ev) {
                 const node = nodeByUid(state, uid);
                 if (!node) return;
                 node.status = node.status === 'disabled' ? 'active' : 'disabled';
-                await writeNode(state, node);
+                // 骨架必须走骨架补丁。以前无差别走 writeNode，会把骨架降级成普通节点
+                // （constant:false + position:before_char + 空关键词），面板却显示"已启用"。
+                if (node.id === 'SKEL') await writeSkeletonEntryOnly(state, node);
+                else await writeNode(state, node);
                 recountReview(state);
                 persist(); render();
                 toast(`${node.id} 已${node.status === 'disabled' ? '禁用' : '启用'}`, 'info');
@@ -1009,6 +1127,15 @@ async function onPanelClick(ev) {
             case 'edit': {
                 const box = btn.closest('.lm-node')?.querySelector('.lm-content');
                 if (box) box.hidden = !box.hidden;
+                break;
+            }
+            case 'edit-keys': {
+                // F9：关键词以前是只读 chip，没有任何修词入口
+                const box = btn.closest('.lm-node')?.querySelector('.lm-keys-edit');
+                if (box) {
+                    box.hidden = !box.hidden;
+                    if (!box.hidden) box.querySelector('input')?.focus();
+                }
                 break;
             }
             case 'delete': {

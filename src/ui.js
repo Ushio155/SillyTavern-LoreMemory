@@ -303,9 +303,11 @@ function bodyHelp(ctx) {
 function nodeRow(node, ctx) {
     const badge = STATUS_BADGE[node.status] || STATUS_BADGE.active;
     const tokens = node.tokens || estimateTokens(node.content);
-    const cap = Number(ctx.settings.nodeTokenCap) || 200;
-    const overCap = tokens > cap;
     const skeleton = ctx.state.skeletonUid === node.uid;
+    // 骨架有自己的上限设置。以前这里一律用 nodeTokenCap(200)，
+    // 导致 200~350 token 的**合法**骨架被误标红，而真正的 350 上限从不起作用。
+    const cap = Number(skeleton ? ctx.settings.skeletonTokenCap : ctx.settings.nodeTokenCap) || (skeleton ? 350 : 200);
+    const overCap = tokens > cap;
 
     return `
     <div class="lm-node ${node.status === 'disabled' ? 'lm-node-off' : ''}" data-lm-uid="${node.uid}">
@@ -320,6 +322,10 @@ function nodeRow(node, ctx) {
         <div class="lm-keys">
             ${(node.keys || []).map(k => `<span class="lm-key">${escapeHtml(k)}</span>`).join('') || '<span class="lm-dim">（无关键词 —— 该条目不会被关键词召回）</span>'}
         </div>
+        ${!skeleton && (node.droppedKeys || []).length
+            ? `<div class="lm-hint">已自动剔除判别力不足的关键词：${(node.droppedKeys || []).map(k => escapeHtml(k)).join('、')}（它们在别的剧情里也会命中，会造成误触发）</div>`
+            : ''}
+        ${!skeleton ? `<div class="lm-keys-edit" hidden><input type="text" class="text_pole lm-key-input" data-lm-keys="${node.uid}" value="${escapeHtml((node.keys || []).join('、'))}" placeholder="用顿号或逗号分隔；留空 = 不再被关键词召回"></div>` : ''}
         <div class="lm-node-meta">
             <span class="${overCap ? 'lm-over' : ''}">${fmtTokens(tokens)} / ${cap} token</span>
             <span>命中 ${node.hits || 0} 次</span>
@@ -330,6 +336,7 @@ function nodeRow(node, ctx) {
             <button class="menu_button lm-mini" data-lm-action="pin" data-lm-uid="${node.uid}" title="强制注入一次（本回合生效）"><i class="fa-solid fa-thumbtack"></i> 钉选</button>
             <button class="menu_button lm-mini" data-lm-action="toggle" data-lm-uid="${node.uid}">${node.status === 'disabled' ? '启用' : '禁用'}</button>
             <button class="menu_button lm-mini" data-lm-action="edit" data-lm-uid="${node.uid}">看正文</button>
+            ${!skeleton ? `<button class="menu_button lm-mini" data-lm-action="edit-keys" data-lm-uid="${node.uid}" title="手工改关键词（改完失焦或回车保存）">改关键词</button>` : ''}
             <button class="menu_button lm-mini" data-lm-action="resummarize" data-lm-uid="${node.uid}" title="用当前提示词重新总结这一段">重摘要</button>
             <button class="menu_button lm-mini lm-mini-danger" data-lm-action="delete" data-lm-uid="${node.uid}">删除</button>
         </div>

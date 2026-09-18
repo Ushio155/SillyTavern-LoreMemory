@@ -73,6 +73,11 @@ function normalizeNode(n) {
         hits: Number(n.hits) || 0,
         lastHitAt: Number.isInteger(n.lastHitAt) ? n.lastHitAt : null,
         source: n.source === 'llm' ? 'llm' : 'demo',
+        // 被判别力闸门剔掉的关键词（面板要如实显示，不然"我的词去哪了"没法解释）
+        droppedKeys: Array.isArray(n.droppedKeys) ? n.droppedKeys.map(String).filter(Boolean) : [],
+        // 重摘要前的上一版正文。注意：这里原本没有登记它，所以 index.js 写的 prevContent
+        // 每次重载都会被这个白名单丢掉 —— FR-11「可撤销」连数据都没留住。
+        prevContent: typeof n.prevContent === 'string' ? n.prevContent : '',
     };
 }
 
