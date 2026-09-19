@@ -895,15 +895,23 @@
 @media (max-width: 768px) {
     /* 关键：卡片必须按**内容**长高，不能被 flex 拉伸成"一屏高"。
      * 拉伸过的卡片只有 844px 高，而内容有 2253px —— 后果有两个：
-     *   ① 卡片那块不透明底色只铺到 844px，往下滚就没有底了；
+     *   ① 卡片只到 844px，往下滚的内容就跑到卡片（= 吸顶头部的包含块）外面去了；
      *   ② 更明显的是头部吸顶失效：sticky 只能在**包含块（卡片）**范围内粘，
      *      卡片一屏高 ⇒ 滚过一屏头部就被带出视野（实测 y=-650），关闭按钮就够不着了。 */
     .lm-modal-root.lm-open {
         align-items: flex-start;
-        /* 整页模式没有"外面"可点，遮罩留着只会让边缘透出后面那层界面。
-           改成容器自己带不透明底色 —— 于是"页面填满整屏"，滚到哪儿都不会透。 */
-        background-color: #1c1c22;
-        background-image: linear-gradient(var(--SmartThemeBlurTintColor, #1c1c22), var(--SmartThemeBlurTintColor, #1c1c22));
+        /* ⚠ 遮罩写在**滚动容器自己**身上，而不是 backdrop 子元素上：
+         * 元素自己的 background 铺的是它自己的 padding box，不随内容滚走；
+         * 而 position:absolute 的 backdrop 属于"内容的一部分"，只有第一屏有它，往下滚就露出后面那层界面
+         * —— 那正是当初给 backdrop 加 display:none 的原因。颜色搬到容器身上，两个毛病一起解决。
+         * 取值与桌面端 .lm-modal-backdrop 同值。 */
+        /* ⚠⚠ 这一层**只能半透明**，绝不能为了"边缘不漏底"改成实心色。
+         * 手机整页模式下卡片铺满整屏（padding: 0 + width: 100%），眼睛看到的透明度 = 遮罩 × 面板：
+         * 遮罩一旦是 #1c1c22 这种实心色（alpha = 1），整页就糊死，用户原话「整页都看不到下方页面」
+         * —— 上一版正是这么写的（纯色兜底 + 主题色渐变层），已经实测回退。
+         * 一句话：面板越"铺满"，遮罩层越不能实心。
+         * （同一条结论在 CardLore 的 cardlore.css 手机段里也留了注释，两边结构一样。） */
+        background: rgba(0, 0, 0, 0.55);
     }
 
     .lm-modal-backdrop { display: none; }
@@ -916,19 +924,21 @@
 
     .lm-modal-card {
         width: 100%;
-        /* 内容比一屏短时也要占满整屏，别在下面露出底色断层 */
-        min-height: 100%;
         max-height: none;
         margin: 0;
         border: 0;
         border-radius: 0;
         box-shadow: none;
-        /* 头部吸顶要求底色**不透明**：主题的 BlurTint 多数带 alpha，直接拿它当底色会让
-           正文从吸顶头部底下透出来。用「渐变层 = 主题色」压在「纯色兜底」上：跟随主题又不透明。 */
-        background-color: #1c1c22;
-        background-image: linear-gradient(var(--SmartThemeBlurTintColor, #1c1c22), var(--SmartThemeBlurTintColor, #1c1c22));
-        /* 吸顶头部要相对**弹窗**这个滚动容器生效，所以卡片自己不能裁切 */
+        /* 头部吸顶要相对**弹窗**这个滚动容器生效，所以卡片自己不能裁切 */
         overflow: visible;
+        /* ⚠ 这里**不写 background / min-height**，让底色回落到基础规则
+         *   `.lm-modal-card { background: var(--SmartThemeBlurTintColor, #1c1c22) }`
+         * —— 主题色带 alpha 时卡片就是半透明，与上面那层遮罩相乘后仍能看见下面那层 ST 界面。
+         * 上一版在这里加了「纯色 #1c1c22 兜底 + 主题色渐变层」和 `min-height: 100%`，方向正好相反：
+         *   · background-color 画在 background-image **下面**，linear-gradient(主题色, 主题色) 在主题色
+         *     不透明时就是一层实心色 ⇒ 卡片 alpha = 1（实测 rgb(28,28,34)）；
+         *   · min-height: 100% 又把这块实心色拉满整屏。
+         * 吸顶头部的不透明**不靠卡片**保证 —— 那是 `.lm-modal-head` 自己的实心主题色（见下）。 */
     }
 
     .lm-modal-head {
