@@ -79,7 +79,7 @@ import {
     fitTranscriptByTokens,
     clampTranscriptTokens,
 } from './src/settings.js';
-import { renderPanel, booksModalHtml, escapeHtml } from './src/ui.js';
+import { renderPanel, booksModalHtml, escapeHtml, bookGroupKey } from './src/ui.js';
 import { isRealChatContext, noChatReason } from './src/context.js';
 // 版本开关：true = 开发者版（多一个「灌入演示节点」），false = 面向用户版（只有「管理聊天书」）
 import { DEVELOPER_BUILD, BUILD_LABEL } from './src/build.js';
@@ -153,8 +153,33 @@ function isSummarizing() {
     }
     return true;
 }
-/** 本回合被手动钉选的 uid，仅用于账本里标注"钉选" */
+/** 本次扫描里被强制注入的 uid，仅用于账本里标注"钉选" */
 const forcedUids = new Set();
+
+/**
+ * 「钉子」意图：用户点了**钉选**或**按角色召回**的 uid，在真正注入出去之前一直留着。
+ *
+ * 为什么不能只靠 ST 那张表（2026-09-19 实测出来的真事故）：
+ * 钉选的做法是把条目塞进 `WorldInfoBuffer.externalActivations`（world-info.js L1025），
+ * 而那是一张**全局一次性**的表 —— ST 在每次 `checkWorldInfo` 结尾都无条件
+ * `buffer.resetExternalEffects()`（L5156）。于是从"点钉选"到"你真正发送"之间
+ * **任何一次扫描**都会把它吞掉，包括：
+ *   · 插件自己的摘要 / 骨架刷新的 **quiet 生成**：它的条目被 `triggers`（不含 quiet）
+ *     挡在 L4695 —— 本来就不会被注入，却照样把表清空；
+ *   · 任何 dry-run 扫描。
+ * 吞掉之后**没有任何痕迹**：quiet 扫描被 `isSummarizing()` 挡住不记账（见 onScanDone），
+ * 条目又被 triggers 挡住不进 prompt，于是面板一片空白、hits 不涨、timedWorldInfo 也是空的 ——
+ * 用户看到的就是「钉选点了没反应」。探针实测（.lorememory-test）：
+ *     pin → 真扫描(normal)            ⇒ 注入 ✓
+ *     pin → quiet 扫描 → normal 扫描  ⇒ 丢失 ✗
+ *     pin → dry-run → normal 扫描      ⇒ 丢失 ✗
+ *
+ * 现在改成：意图存在这里，**每次扫描前**（WORLDINFO_ENTRIES_LOADED —— 它发生在条目已加载、
+ * 激活循环之前，而且 ST 的 emit 是逐个 await 监听器的）重新喂给 ST；
+ * 哪一次扫描真的把它激活了，才从表里删掉（仍然保持"注入一次"的语义）。
+ * 表会随时间过期，所以面板上「已钉选」的状态也跟着它走：还挂着 = 琥珀色。
+ */
+const pinnedUids = new Set();
 /** 本回合是否有 /lm-recall 塞过关键词，扫描后清掉 */
 let recallActive = false;
 /** 书是否已确认存在于磁盘 */
@@ -221,6 +246,51 @@ function setDrawerState(key, open) {
     const drawers = getDrawerState();
     drawers[key] = !!open;
     saveSettingsDebounced();
+}
+
+// ───────────────────────── 「记忆节点」分页（跨重绘保留） ─────────────────────────
+
+/**
+ * 单页显示多少条 / 当前第几页。
+ *
+ * 放在 `extension_settings.LoreMemory.ui` 里（和折叠状态同一个位置），**不进聊天存档** ——
+ * 它是"我怎么看"的偏好，不是"这个聊天记了什么"，换聊天不该变。
+ * 与设置项（promptInterval 那些）分开也是刻意的：那不是生成参数，不该出现在「生成设置」里，
+ * 也不该被 normalizeSettings 夹取。
+ */
+const PAGE_SIZES = [10, 25, 50, 100];
+const DEFAULT_PAGE_SIZE = 10;
+
+function getNodesPager() {
+    const holder = extension_settings[MODULE_NAME] || (extension_settings[MODULE_NAME] = {});
+    if (!holder.ui || typeof holder.ui !== 'object') holder.ui = { drawers: {} };
+    const p = holder.ui.nodesPager;
+    const perPage = PAGE_SIZES.includes(Number(p?.perPage)) ? Number(p.perPage) : DEFAULT_PAGE_SIZE;
+    const page = Number.isInteger(Number(p?.page)) && Number(p.page) > 0 ? Number(p.page) : 1;
+    holder.ui.nodesPager = { perPage, page };
+    return holder.ui.nodesPager;
+}
+
+function setNodesPager(patch = {}) {
+    const p = getNodesPager();
+    if (patch.perPage !== undefined) {
+        const n = Number(patch.perPage);
+        // 改每页条数时回到第 1 页：否则"第 7 页 × 100/页"会直接翻到不存在的页
+        p.perPage = PAGE_SIZES.includes(n) ? n : DEFAULT_PAGE_SIZE;
+        p.page = 1;
+    }
+    if (patch.page !== undefined) p.page = Math.max(1, Number(patch.page) || 1);
+    if (patch.delta !== undefined) p.page = Math.max(1, p.page + (Number(patch.delta) || 0));
+    saveSettingsDebounced();
+    return p;
+}
+
+/** 夹回合法页（删节点后当前页可能已经不存在了）—— 和 README 里"游标夹回"同一个道理 */
+function clampPagerPage(total, perPage) {
+    const pages = Math.max(1, Math.ceil(total / perPage));
+    const p = getNodesPager();
+    if (p.page > pages) { p.page = pages; saveSettingsDebounced(); }
+    return p.page;
 }
 
 // ───────────────────────── 状态读写 ─────────────────────────
@@ -898,6 +968,9 @@ async function onChatChanged() {
     bookReady = false;
     foreignBookWarned = false;
     forcedUids.clear();
+    // 钉子是按 uid 记的，换了聊天就是另一本书里的另一批 uid —— 必须清掉，
+    // 否则上一个聊天的钉选会打到新聊天的同名 uid 上。
+    pinnedUids.clear();
     clearRecall();
     if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
 
@@ -999,6 +1072,7 @@ async function clearMemory() {
     }
     // 条目删完了，面板状态也要跟着清零（和「删除聊天书」共用同一段：少一处漏改）
     resetMemoryState(state);
+    pinnedUids.clear();   // 钉子指向的条目已经不在书里了
     persist();
     render();
     toast('已清空记忆条目', 'success');
@@ -1073,7 +1147,7 @@ async function cleanupEmptyBooks() {
  * 弹窗状态。不进存档 —— 关掉页面就该忘掉（不像面板的折叠状态，那个要跨重绘保留）。
  * `entries` 是当前展开那本书的条目缓存，`books` 是列表快照。
  */
-const booksModal = { open: false, books: [], activeName: '', expanded: null, entries: [], error: '', busy: false, collapsedGroups: [] };
+const booksModal = { open: false, books: [], activeName: '', expanded: null, entries: [], error: '', busy: false, collapsedGroups: null };
 
 /** 弹窗容器（惰性创建，挂在 body 上） */
 function booksModalRoot() {
@@ -1174,10 +1248,17 @@ function renderBooksModal() {
     });
 }
 
-/** 折叠 / 展开一个角色卡分组（分组名就是这本书名里推出来的角色卡名） */
+/**
+ * 折叠 / 展开一个角色卡分组（分组名就是这本书名里推出来的角色卡名）。
+ *
+ * `collapsedGroups === null` 表示"用户还没动过" —— 那时**所有分组都是折叠的**，
+ * 所以第一次点开某一组时，起点必须是"全部收起"再减去这一组，
+ * 否则 `new Set(null)` 会变成空集，一点下去所有组一起展开（那就是原来的默认行为）。
+ */
 function toggleBookGroup(name) {
     if (!name) return;
-    const set = new Set(booksModal.collapsedGroups);
+    const all = new Set((booksModal.books || []).map(b => bookGroupKey(b.name)));
+    const set = new Set(booksModal.collapsedGroups === null ? all : booksModal.collapsedGroups);
     if (set.has(name)) set.delete(name); else set.add(name);
     booksModal.collapsedGroups = [...set];
     renderBooksModal();
@@ -1214,6 +1295,9 @@ async function openBooksModal() {
     booksModal.entries = [];
     booksModal.error = '';
     booksModal.busy = true;
+    // null = "还没动过" → 弹窗里所有角色卡分组**默认折叠**（一眼看到有哪几张卡，
+    // 而不是一屏被几十本书铺满）；用户点开过的组由 toggleBookGroup 记成显式数组。
+    booksModal.collapsedGroups = null;
     renderBooksModal();          // 先出框架，别让用户觉得"点了没反应"
     await refreshBooksModal();
     return booksModal.books;
@@ -1434,11 +1518,11 @@ async function onBooksModalClick(ev) {
  * @param {number[]} uids
  * @param {string} label 提示语里的动作名
  */
-async function forceActivate(uids, label) {
+async function collectForcedClones(uids) {
     const state = getState();
     const list = [...new Set((uids || []).filter(Number.isInteger))];
-    if (!state || !state.bookName) { toast('还没有绑定世界书', 'warning'); return { ok: false, count: 0, tokens: 0 }; }
-    if (!list.length) return { ok: false, count: 0, tokens: 0 };
+    if (!state || !state.bookName) { toast('还没有绑定世界书', 'warning'); return { ok: false, clones: [], missing: [], disabled: [], tokens: 0 }; }
+    if (!list.length) return { ok: false, clones: [], missing: [], disabled: [], tokens: 0 };
 
     const data = await loadWorldInfo(state.bookName);
     const clones = [];
@@ -1456,7 +1540,21 @@ async function forceActivate(uids, label) {
         tokens += estimateTokens(entry.content);
         forcedUids.add(uid);
     }
+    // 条目已经从书里消失 → 钉子作废（面板上的琥珀色也该跟着灭）。
+    // 只是被禁用的话**留着**：用户很可能正在改关键词，改完就该生效。
+    for (const uid of missing) pinnedUids.delete(uid);
+    return { ok: clones.length > 0, clones, missing, disabled, tokens };
+}
 
+/**
+ * 强制注入一组条目（钉选 / 实体召回 / `/lm-pin` 共用）—— **一次性**：
+ * 只在本次扫描有效，下一次扫描前不会自动重喂（要那种语义请用 pinNode / recallCast）。
+ *
+ * @param {number[]} uids
+ * @param {string} label 提示语里的动作名
+ */
+async function forceActivate(uids, label) {
+    const { clones, missing, disabled, tokens } = await collectForcedClones(uids);
     if (!clones.length) {
         toast(`${label}：没有可注入的条目${disabled.length ? `（${disabled.length} 条在书里是禁用状态）` : ''}`, 'warning');
         return { ok: false, count: 0, tokens: 0, missing, disabled };
@@ -1469,33 +1567,108 @@ async function forceActivate(uids, label) {
         missing.length ? `${missing.length} 条不在书里` : '',
         disabled.length ? `${disabled.length} 条已禁用` : '',
     ].filter(Boolean);
-    toast(`${label}：本回合必定注入 ${clones.length} 条（约 ${tokens} token）${skipped.length ? `，跳过 ${skipped.join('、')}` : ''}`, 'success');
+    toast(`${label}：已排队 ${clones.length} 条（约 ${tokens} token），下一次生成必定带上${skipped.length ? `；跳过 ${skipped.join('、')}` : ''}`, 'success');
     render();
     return { ok: true, count: clones.length, tokens, missing, disabled };
 }
 
 /**
- * 钉选：强制某节点本回合注入一次。
- * @param {number} uid
+ * 把 `pinnedUids` 里还挂着的钉子**重新喂给 ST**。
+ *
+ * 调用点只有一个：`WORLDINFO_ENTRIES_LOADED`（`getSortedEntries()` 末尾，world-info.js L4492）——
+ * 它在**每一次** checkWorldInfo 里、激活循环之前触发，而且是 `await eventSource.emit(...)`，
+ * 所以这里返回 promise 会被等到，条目进入激活循环之前一定已经就位。
+ * 换句话说：钉子不再是"点一次、等运气"，而是"每次扫描都带着它，直到真的注入出去"。
+ *
+ * @returns {Promise<number>} 本次真的喂进去几条
  */
-async function pinNode(uid) {
-    const state = getState();
-    if (!state || !state.bookName) { toast('还没有绑定世界书', 'warning'); return; }
-    const node = nodeByUid(state, uid);
-    return forceActivate([uid], `已钉选${node ? `：${node.id} ${node.title}` : ''}`);
+async function armPinned() {
+    if (!pinnedUids.size) return 0;
+    const { clones } = await collectForcedClones([...pinnedUids]);
+    if (!clones.length) return 0;
+    await eventSource.emit(event_types.WORLDINFO_FORCE_ACTIVATE, clones);
+    return clones.length;
+}
+
+function onEntriesLoaded() {
+    // 必须返回 promise：ST 的 EventEmitter.emit 是 async 且逐个 await 监听器
+    // （lib/eventemitter.js L146），返回 promise 才能真正"等我喂完再进激活循环"。
+    return armPinned().catch(e => console.warn('[LoreMemory] 重新武装钉选失败', e));
 }
 
 /**
- * 实体召回：把「正文提到这个词」的节点全部强制注入本回合。
+ * 取消钉子时**还要把已经喂进 ST 那张表里的那一份作废**。
+ *
+ * 为什么需要（driver 的「再点一次 = 取消」断言实测抓到的）：
+ * pinNode 会立刻 emit 一次，条目就躺在 `WorldInfoBuffer.externalActivations` 里；
+ * 之后取消只清掉我们的意图，ST 那张表里的副本还在 —— 下一次扫描照样把它注入。
+ * 那张表没法删（ST 不导出 WorldInfoBuffer），但可以**覆盖**：同一个 world.uid 再 set 一次。
+ * 覆盖成 `disable: true` 的空壳即可：ST 在 L4689 的禁用检查排在强制注入（L4774）之前，
+ * 于是它绝不会进 prompt，也不会在账本里留下假的"钉选"命中。
+ *
+ * @param {number[]} uids
+ */
+async function disarmForced(uids) {
+    const state = getState();
+    const list = [...new Set((uids || []).filter(Number.isInteger))];
+    if (!state || !state.bookName || !list.length) return 0;
+    await eventSource.emit(event_types.WORLDINFO_FORCE_ACTIVATE,
+        list.map(uid => ({ world: state.bookName, uid, disable: true, content: '' })));
+    return list.length;
+}
+
+/**
+ * 钉选：强制某节点**下一次生成**注入一次。
+ *
+ * 再点一次 = 取消（面板上琥珀色跟着走）。意图保存在 `pinnedUids`，中间被任何扫描
+ * 吞掉都会在下次扫描前自动补喂 —— 见该变量的注释里的实测数据。
+ *
+ * @param {number} uid
+ * @param {{toggle?:boolean}} opts toggle=false 时只加不减（给脚本/命令用）
+ */
+async function pinNode(uid, { toggle = true } = {}) {
+    const state = getState();
+    if (!state || !state.bookName) { toast('还没有绑定世界书', 'warning'); return { ok: false }; }
+    if (!Number.isInteger(uid)) return { ok: false };
+    const node = nodeByUid(state, uid);
+    const label = node ? `${node.id} ${node.title}` : `uid ${uid}`;
+
+    if (toggle && pinnedUids.has(uid)) {
+        pinnedUids.delete(uid);
+        await disarmForced([uid]);
+        toast(`已取消钉选：${label}（下一次生成不再强制带上它）`, 'info');
+        render();
+        return { ok: true, pinned: false };
+    }
+
+    const r = await collectForcedClones([uid]);
+    if (!r.clones.length) {
+        toast(`钉选失败：${label} 现在注入不进去（${r.disabled.length ? '条目在书里是禁用状态' : '条目不在书里'}）`, 'warning');
+        render();
+        return { ok: false, disabled: r.disabled.length, missing: r.missing.length };
+    }
+    pinnedUids.add(uid);
+    await eventSource.emit(event_types.WORLDINFO_FORCE_ACTIVATE, r.clones);
+    toast(`已钉选：${label}（约 ${r.tokens} token）—— 下一次生成必定带上它，再点一次可取消`, 'success');
+    render();
+    return { ok: true, pinned: true, tokens: r.tokens };
+}
+
+/**
+ * 实体召回：把「正文提到这个词」的节点全部强制注入**下一次生成**。
  *
  * 为什么不能只靠 `/lm-recall` 那条老路：它只是把词塞进扫描缓冲，然后指望条目自带的
  * **key** 命中 —— 而多配角轮换的场景里，配角名恰恰会被判别力闸门剔掉（见 src/store.js
  * 顶部的实测数据）。这条路不看 key，只看正文，所以闸门怎么判都不影响它。
  *
+ * 与 `forceActivate` 的区别：这些 uid 会进 `pinnedUids` 并**在每次扫描前重新喂给 ST**，
+ * 所以中间夹一次自动摘要的 quiet 生成也不会把它吃掉（那正是"点了没反应"的老病根）。
+ * 再点同一个名字 = 取消召回（面板上那枚 chip 的琥珀色跟着走）。
+ *
  * @param {string} term 角色名（或任何词）
- * @param {{via?:string}} opts
+ * @param {{via?:string, toggle?:boolean}} opts
  */
-async function recallCast(term, { via = '按角色召回' } = {}) {
+async function recallCast(term, { via = '按角色召回', toggle = true } = {}) {
     const state = getState();
     const q = String(term || '').trim();
     if (!q) { toast('用法：/lm-recall 缇娜（点面板上的角色名也一样）', 'warning'); return { ok: false, message: '用法：/lm-recall 缇娜' }; }
@@ -1510,12 +1683,33 @@ async function recallCast(term, { via = '按角色召回' } = {}) {
         return { ok: false, message, blocked: blocked.length };
     }
 
-    const r = await forceActivate(injectable.map(n => n.uid), `${via}「${q}」`);
+    const uids = injectable.map(n => n.uid);
     const ids = injectable.map(n => n.id).join(' ');
+
+    // 整组都已经挂着 → 这一次点击是"取消"
+    if (toggle && uids.every(u => pinnedUids.has(u))) {
+        for (const u of uids) pinnedUids.delete(u);
+        await disarmForced(uids);
+        const message = `已取消${via}「${q}」（${ids} 下一次生成不再被强制带上）`;
+        toast(message, 'info');
+        render();
+        return { ok: true, message, ids, cancelled: true, count: 0, blocked: blocked.length };
+    }
+
+    const r = await collectForcedClones(uids);
+    if (!r.clones.length) {
+        const message = `${via}「${q}」失败：这些条目现在注入不进去（${r.disabled.length} 条禁用 / ${r.missing.length} 条不在书里）`;
+        toast(message, 'warning');
+        return { ok: false, message, blocked: blocked.length };
+    }
+    for (const c of r.clones) pinnedUids.add(c.uid);
+    await eventSource.emit(event_types.WORLDINFO_FORCE_ACTIVATE, r.clones);
+    toast(`${via}「${q}」：已排队 ${r.clones.length} 条（约 ${r.tokens} token），下一次生成必定带上；再点一次可取消`, 'success');
+    render();
     return {
-        ok: r.ok,
+        ok: true,
         message: `${via}「${q}」→ ${ids}${blocked.length ? `（另有 ${blocked.length} 条待确认/已禁用被跳过）` : ''}`,
-        ids, count: r.count, tokens: r.tokens, blocked: blocked.length,
+        ids, count: r.clones.length, tokens: r.tokens, blocked: blocked.length,
     };
 }
 
@@ -1586,10 +1780,18 @@ function onScanDone(args) {
 
     const turn = chatMessages().length;
     recordTurn(state, turn, items);
+    // 钉子只要**真的被这次扫描激活过**就释放（"注入一次"语义）。
+    // 注意这里不能按"这次扫描发生过"来清：被 triggers 挡掉的 quiet 扫描
+    // （插件自己的摘要请求）根本注入不了，清了就等于把用户的钉选悄悄丢掉。
+    let released = 0;
+    for (const it of items) {
+        if (pinnedUids.delete(it.uid)) released++;
+    }
     forcedUids.clear();
     clearRecall();
     persist();
     render();
+    if (released) console.debug(`[LoreMemory] 本次扫描交付了 ${released} 条钉选/召回`);
 }
 
 // ───────────────────────── 面板挂载与事件 ─────────────────────────
@@ -1630,6 +1832,10 @@ function render() {
         maxContext: Number(ctx.maxContext) || 0,
         stVersion,
         pending: pendingCount(chatMessages().length, state.cursor),
+        // 「已钉选 / 已按角色召回」的 uid：面板据此把按钮点亮成琥珀色
+        pinnedUids: new Set(pinnedUids),
+        // 「记忆节点」分页（每页条数 / 当前页）
+        pager: { ...getNodesPager(), sizes: PAGE_SIZES },
     });
     renderSettingsAdvice(state);
 }
@@ -1701,6 +1907,13 @@ async function onPanelSettingChange(ev) {
         await saveNodeTier(Number(tierEl.dataset.lmTier), tierEl.value);
         return;
     }
+    // 「记忆节点」每页条数（世界书同款 sizeChanger）
+    const sizeEl = ev.target.closest('[data-lm-page-size]');
+    if (sizeEl) {
+        setNodesPager({ perPage: sizeEl.value });
+        render();
+        return;
+    }
     const el = ev.target.closest('[data-lm-setting]');
     if (!el) return;
     if (el.tagName === 'TEXTAREA') return;
@@ -1721,6 +1934,14 @@ async function onPanelClick(ev) {
             setDrawerState(drawerEl.dataset.lmDrawer, !wasOpen);
         }
         return;   // 折叠标题上不该有别的动作
+    }
+
+    // 「记忆节点」翻页按钮
+    const pageEl = ev.target.closest('[data-lm-page]');
+    if (pageEl) {
+        setNodesPager({ delta: Number(pageEl.dataset.lmPage) });
+        render();
+        return;
     }
 
     // 「按角色召回」chip：它不带 uid，也不是 lm-action，单独处理
@@ -1851,7 +2072,7 @@ function renderSettingsAdvice(state) {
             </tbody>
         </table>
         <div class="lm-actions lm-actions-tight">
-            <button class="menu_button lm-btn" data-lm-openwi="1"><i class="fa-solid fa-book"></i> 打开 ST 的世界书面板去调整</button>
+            <button class="menu_button lm-btn lm-btn-block lm-tone-key" data-lm-openwi="1"><i class="fa-solid fa-book"></i> 打开 ST 的世界书面板去调整</button>
         </div>
         <p class="lm-dim">当前生成参数：每 ${settings.promptInterval} 条总结 · 扫描范围 ${{ all: '角色+用户', char: '仅角色', user: '仅用户' }[settings.scanScope]} ·
             sticky ${settings.sticky} / cooldown ${settings.cooldown} · 节点上限 ${settings.nodeTokenCap} token</p>`;
@@ -1999,11 +2220,14 @@ function registerCommands() {
             if (!state) return '没有打开聊天';
             const node = findNode(state, uidOrId);
             if (!node) return `找不到节点：${uidOrId}（用 /lm-list 看列表）`;
-            await pinNode(node.uid);
-            return `已钉选 ${node.id} ${node.title}`;
+            const r = await pinNode(node.uid);
+            if (r?.pinned === false) return `已取消钉选 ${node.id} ${node.title}`;
+            if (!r?.ok) return `钉选失败：${node.id} ${node.title}（条目可能已被禁用或不在书里）`;
+            return `已钉选 ${node.id} ${node.title} —— 下一次生成必定带上它`;
         },
         unnamedArgumentList: [new SlashCommandArgument('节点 id 或标题片段', [ARGUMENT_TYPE.STRING], true)],
-        helpString: '强制某个记忆节点在本回合被注入一次（下一回合自动失效）。',
+        helpString: '强制某个记忆节点在下一次生成被注入（再打一次取消）。'
+            + '钉子会一直挂着直到真的注入出去 —— 中间夹一次自动摘要的 quiet 生成不会把它吃掉。',
         returns: ARGUMENT_TYPE.STRING,
     });
 
@@ -2012,7 +2236,8 @@ function registerCommands() {
         callback: (_args, keys) => recallByTerm(String(keys || '')),
         unnamedArgumentList: [new SlashCommandArgument('要强行召回的关键词，或一个人名', [ARGUMENT_TYPE.STRING], true)],
         helpString: '即使最近消息里没提到这个词，也让相关记忆节点被激活。关键词还命中得了就走原生扫描缓冲；'
-            + '命中不了（比如反复出场的配角名被判别力闸门剔掉了）就自动改成按正文召回。',
+            + '命中不了（比如反复出场的配角名被判别力闸门剔掉了）就自动改成按正文召回，'
+            + '并一直挂到真的注入出去（再打一次同一个词可取消）。',
         returns: ARGUMENT_TYPE.STRING,
     });
 
@@ -2083,6 +2308,12 @@ async function init() {
     // 核心：账本完全依赖 ST 的扫描结果，插件不模拟扫描
     eventSource.on(event_types.WORLDINFO_SCAN_DONE, onScanDone);
 
+    // 钉选 / 按角色召回的**重新武装**点。
+    // ST 把 externalActivations 当成"全局一次性"表（每次扫描结尾无条件清空，L5156），
+    // 而本事件在每次扫描的激活循环之前、且是 await 的（L4492）—— 在这里补喂，
+    // 钉子就不会被中间那次 quiet 摘要扫描吃掉。
+    eventSource.on(event_types.WORLDINFO_ENTRIES_LOADED, onEntriesLoaded);
+
     // 自动记忆：每收到消息按阈值决定要不要总结
     eventSource.on(event_types.MESSAGE_RECEIVED, () => {
         try {
@@ -2127,6 +2358,13 @@ window.LoreMemory = {
     pinNode, recallKeys, ensureBook, getSettings, updateSetting,
     // 实体召回（按需那条路）：把"某个配角之前发生了什么"捞回来，不依赖关键词
     recallCast, recallByTerm, forceActivate,
+    // 钉子意图（钉选 / 按角色召回都落在这里）：面板的琥珀色、以及"中间那次扫描不会吃掉它"
+    // 这条保证都靠它。armPinned 暴露出来是为了让测试能在不发送消息的前提下验证重新武装。
+    get pinnedUids() { return [...pinnedUids]; },
+    armPinned, collectForcedClones, disarmForced,
+    // 「记忆节点」分页偏好（每页条数 / 当前页）
+    get pager() { return { ...getNodesPager(), sizes: PAGE_SIZES }; },
+    setNodesPager, getNodesPager,
     cleanupEmptyBooks, isRealChatContext,
     // 管理聊天书（两个版本都有）
     openBooksModal, closeBooksModal, refreshBooksModal, listPluginBooks,

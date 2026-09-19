@@ -245,6 +245,9 @@ function mentions(node, term) {
  * 名字只从「谁在场」行里收 —— 这个来源自带语义，天然把「敏感度」这类机制词挡在外面
  * （它们不会出现在谁在场里）。权重用"提到它的节点数"而不是"它在场行里出现几次"，
  * 因为用户要的是"点一下能捞出多少记忆"。
+ *
+ * `uids` 是这些节点的 uid，面板用它判断"这一枚 chip 是不是正挂着"（命中即整组召回，
+ * 所以按角色召回的状态是**整组**的：组里还有一条没交付，chip 就还是亮的）。
  */
 export function castIndex(state) {
     const nodes = recallableNodes(state);
@@ -253,8 +256,10 @@ export function castIndex(state) {
     const out = [];
     for (const name of names) {
         const needle = name.toLowerCase();
-        const count = nodes.filter(n => mentions(n, needle)).length;
-        if (count > 0) out.push({ name, count });
+        const hits = nodes.filter(n => mentions(n, needle));
+        if (hits.length > 0) {
+            out.push({ name, count: hits.length, uids: hits.map(n => n.uid).filter(Number.isInteger) });
+        }
     }
     // 排序不用 localeCompare：断言要跨环境稳定（Node 与无头 Edge 的排序规则未必一致）
     return out.sort((a, b) => (b.count - a.count) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));

@@ -151,14 +151,56 @@
 
 .lm-actions-grid2 .menu_button.lm-btn { width: 100%; }
 
-.lm-btn-primary {
+/* ── 语义色：
+ *  · lm-tone-amber（琥珀）——「立刻总结未总结的消息」：一个会真花钱/真调模型的主动作，
+ *    和「刷新 / 清空」这类管理键区分开；也是「钉选 / 按角色召回**已生效**」的提示色。
+ *  · lm-tone-key（蓝）—— 通往世界书的入口（管理聊天书 / 打开 ST 世界书面板），
+ *    用和条目关键词 chip（.lm-key）同款蓝，一眼看出"这些按钮通向世界书"。
+ *
+ * ⚠️ 选择器**必须带 `#lm_panel_root`**（半个类都不行）—— 这是实测出来的坑：
+ *   本机那份 ST 主题写了 `#top-settings-holder .drawer-content .menu_button { color: … !important }`，
+ *   特异性 (1,2,0) + !important；而面板正好挂在 `#top-settings-holder .drawer-content` 里，
+ *   于是单类选择器 `.lm-tone-amber { color: … !important }`（(0,1,0)）**赢不了** ——
+ *   现场表现极其迷惑：图标的色对（规则命中子元素），按钮文字却还是主题色。
+ *   这里用 (1,3,0) 稳定压过它；顺带把同一种坑的两条（主色绿 / 危险色红）一起修了，
+ *   它们以前也是单类选择器，在有这种主题的机器上一直是失效的。
+ *   图标跟着字色走：ST 的 `.menu_button i` 有时会自己上色，所以显式一起声明。 */
+.lm-settings-block #lm_panel_root .menu_button.lm-tone-amber,
+.lm-settings-block #lm_panel_root .menu_button.lm-tone-amber i {
+    color: var(--lm-warn) !important;
+}
+
+.lm-settings-block #lm_panel_root .menu_button.lm-tone-key,
+.lm-settings-block #lm_panel_root .menu_button.lm-tone-key i {
+    color: var(--lm-key) !important;
+}
+
+.lm-settings-block #lm_panel_root .menu_button.lm-tone-key {
+    border-color: var(--lm-key) !important;
+}
+
+.lm-settings-block #lm_panel_root .menu_button.lm-btn-primary {
     border-color: var(--lm-ok) !important;
     color: var(--lm-ok) !important;
 }
 
-.lm-settings-block .menu_button.lm-btn-danger {
+.lm-settings-block #lm_panel_root .menu_button.lm-btn-danger,
+.lm-settings-block #lm_panel_root .menu_button.lm-mini-danger {
     border-color: var(--lm-bad) !important;
     color: var(--lm-bad) !important;
+}
+
+/* 「生效中」的按钮：钉选 / 按角色召回点了之后、真正注入出去之前一直亮着。
+ * 主体是用户要的"琥珀色字体 + 琥珀色图标"；另外给边框和一点点底色，
+ * 因为这两个键都很小，只有字色变黄在深色主题下不够醒目（这就是"看不出有没有生效"的老问题）。 */
+.lm-settings-block #lm_panel_root .menu_button.lm-is-on,
+.lm-settings-block #lm_panel_root .menu_button.lm-is-on i {
+    color: var(--lm-warn) !important;
+}
+
+.lm-settings-block #lm_panel_root .menu_button.lm-is-on {
+    border-color: var(--lm-warn) !important;
+    background: rgba(242, 201, 76, 0.12);
 }
 
 .lm-settings-block .menu_button.lm-mini {
@@ -169,11 +211,6 @@
     font-size: 0.78em;
     padding: 2px 7px;
     margin: 0;
-}
-
-.lm-settings-block .menu_button.lm-mini-danger {
-    color: var(--lm-bad) !important;
-    border-color: var(--lm-bad) !important;
 }
 
 /* ── 区块 ── */
@@ -356,6 +393,35 @@
 }
 
 .lm-cast-chip b { opacity: 0.65; }
+
+/* ── 「记忆节点」分页条 ──
+ * 长聊里节点会攒到几十条，一列全摊开既难滚也找不到东西。做法照 ST 世界书面板：
+ * 左边「25/page」选择器，中间"第 N/M 页 · 显示 a-b 条 / 共 c 条"，右边上一页/下一页。
+ * 窄屏（手机）允许换行，选择器不让它被压扁。 */
+.lm-pager {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin: 0 0 6px;
+    font-size: 0.8em;
+}
+
+.lm-pager-bottom { margin: 6px 0 0; }
+
+.lm-page-size {
+    width: auto;
+    min-width: 78px;
+    flex: 0 0 auto;
+    font-size: 0.95em;
+    padding: 2px 4px;
+}
+
+.lm-page-info { flex: 1 1 auto; min-width: 0; }
+
+.lm-page-nav { display: flex; gap: 4px; flex: 0 0 auto; }
+
+.lm-page-nav .menu_button[disabled] { opacity: 0.4; cursor: default; }
 
 .lm-tophits { display: flex; flex-wrap: wrap; gap: 5px; }
 
