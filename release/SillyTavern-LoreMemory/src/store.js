@@ -155,3 +155,149 @@ export function topHitNodes(state, n = 5) {
         .sort((a, b) => (b.hits - a.hits))
         .slice(0, n);
 }
+
+// ───────────────────────── 角色索引与实体召回（按需触发的那一半） ─────────────────────────
+
+/**
+ * 为什么需要这一层（2026-09-19，用真实闸门函数实测出来的）：
+ *
+ * 关键词判别力闸门（`seed.js` 的 `dropIndiscriminativeKeys`）拿**出现频率**当证据，
+ * 而频率对两类词的含义正好**相反**：对「敏感度」这种每回合都吐的机制词，高频是噪声的证据；
+ * 对一个反复出场的配角，高频恰恰是"这是核心人物"的证据。同一个判据对它们给出同一个判决 ——
+ *   配角每 2 楼露一次面（60 楼）  → 总出现 30/60，区间外 28 → 剔除(omnipresent)
+ *   机制词「敏感度」每 2 楼        → 总出现 30/60，区间外 28 → 剔除(omnipresent)
+ * 于是"多配角轮换"的聊天里，配角名既不会被模型写进关键词（提示词要求"只在这段剧情里出现"），
+ * 写进去了也会被闸门剔掉；之后无论怎么提到这个配角，他的旧记忆都召不回来 ——
+ * `/lm-recall 缇娜` 也救不了，因为它只是把词塞进扫描缓冲，**前提是某个条目的 key 里还有这个词**。
+ *
+ * 这里给的不是"放宽闸门"（那等于把噪声词一起放进来），而是**换一条召回通道**：
+ * 不看 key，只看**正文里提到了谁** —— 由用户点一下面板上的角色 chip、或打一条
+ * `/lm-recall 人名` 触发。代价当场可见（注入几条、约多少 token），且完全不依赖模型配合。
+ */
+
+/**
+ * 「谁在场」那一行的标签有两种写法，因为它们是**两份不同的默认提示词**产出的：
+ *  · 节点：`【谁在场】{{user}}、林晚、独眼（左眼覆铁片）` —— 方括号后面**没有冒号**
+ *  · 骨架：`在场：林晚、缇娜` —— 有冒号
+ * 所以不能共用一个「标签 + 冒号」的正则。
+ */
+const CAST_BRACKETED = /【\s*(?:谁在场|在场人物|在场)\s*】\s*([^\n【]*)/;
+const CAST_PLAIN = /^[^\S\n]*[>#*•●\-–—]*[^\S\n]*(?:谁在场|在场人物|在场)[^\S\n]*[：:][^\S\n]*([^\n]*)/m;
+
+/** 取出「谁在场」那一行的正文（取不到就返回空串） */
+export function castLineOf(content) {
+    const text = String(content ?? '');
+    const m = CAST_BRACKETED.exec(text) || CAST_PLAIN.exec(text);
+    return m ? String(m[1]).trim() : '';
+}
+
+/**
+ * 把一个「谁在场」行拆成名字。
+ * 过滤规则都是演示数据/真实数据里真出现过的噪声，不是凭空加的：
+ *  · `{{user}}` / `{{char}}` 占位符（演示数据就是这么写的）
+ *  · 括号里的注解 —— `独眼（左眼覆铁片）` 要变成 `独眼`，否则按名字查正文查不到
+ *  · 单字名（中文里单字误命中率太高，与 checkKeys 的判据一致）
+ *  · 超长串（`驿站老板老周` 这种带描述的写法仍然保留，但 12 字以上的多半是整句话）
+ */
+export function splitCastNames(raw) {
+    const out = [];
+    for (const part of String(raw ?? '').split(/[、,，;；\/|]+/)) {
+        const name = part
+            .replace(/[（(][^）)]*[）)]/g, '')          // 去掉别名注解
+            .replace(/^[\s>#*•●\-–—]+/, '')
+            .replace(/[\s。；;，,、]+$/, '')
+            .trim();
+        if (!name) continue;
+        if (name.includes('{{')) continue;             // {{user}} / {{char}}
+        const len = [...name].length;
+        if (len < 2 || len > 12) continue;
+        if (out.includes(name)) continue;
+        out.push(name);
+    }
+    return out;
+}
+
+/** 一个节点「谁在场」里写到的名字 */
+export function nodeCastNames(node) {
+    return splitCastNames(castLineOf(node && node.content));
+}
+
+/**
+ * 能参与召回的节点：排除骨架（它本来就常驻注入，不用召）与已归档的。
+ * 待确认（needs_review）节点**保留在候选里** —— 它们恰恰是最需要被按角色捞回来的
+ * （关键词被剔光才会待确认），能不能真注入由 `recallTargets` 分组说明。
+ */
+function recallableNodes(state) {
+    const skel = state ? state.skeletonUid : null;
+    return ((state && state.nodes) || [])
+        .filter(n => n && n.status !== 'archived')
+        .filter(n => !(Number.isInteger(skel) && n.uid === skel));
+}
+
+/** 正文是否提到这个词（大小写不敏感；与 ST 的扫描一样是"子串包含"） */
+function mentions(node, term) {
+    return String((node && node.content) || '').toLowerCase().includes(term);
+}
+
+/**
+ * 全聊天的角色索引：名字 → **有多少个节点提到它**（正文出现即算，不只看在场行）。
+ *
+ * 名字只从「谁在场」行里收 —— 这个来源自带语义，天然把「敏感度」这类机制词挡在外面
+ * （它们不会出现在谁在场里）。权重用"提到它的节点数"而不是"它在场行里出现几次"，
+ * 因为用户要的是"点一下能捞出多少记忆"。
+ */
+export function castIndex(state) {
+    const nodes = recallableNodes(state);
+    const names = new Set();
+    for (const n of nodes) for (const name of nodeCastNames(n)) names.add(name);
+    const out = [];
+    for (const name of names) {
+        const needle = name.toLowerCase();
+        const count = nodes.filter(n => mentions(n, needle)).length;
+        if (count > 0) out.push({ name, count });
+    }
+    // 排序不用 localeCompare：断言要跨环境稳定（Node 与无头 Edge 的排序规则未必一致）
+    return out.sort((a, b) => (b.count - a.count) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+}
+
+/**
+ * 实体召回的候选，按「能不能真注入」分成两组。
+ *
+ * 分组不是保守估计，是**宿主行为**逼出来的：被外部强制激活的条目仍然要在
+ * `world-info.js` L4689 过 `entry.disable == true` 检查，而那个检查在 L4774 的
+ * `getExternallyActivated()`**之前** —— 书里被禁用的条目根本走不到强制注入那一支。
+ * 本插件把「待确认 / 已禁用 / 已归档」都写成 `disable: true`，所以它们拉不进来，
+ * 必须如实告诉用户"先去改关键词恢复"，不能假装注入成功。
+ *
+ * @param {object} state
+ * @param {string} term 角色名（或任何词）
+ * @returns {{term:string, injectable:object[], blocked:object[]}}
+ */
+export function recallTargets(state, term) {
+    const q = String(term ?? '').trim();
+    const injectable = [];
+    const blocked = [];
+    if (!q) return { term: q, injectable, blocked };
+    const needle = q.toLowerCase();
+    for (const n of recallableNodes(state)) {
+        if (!mentions(n, needle)) continue;
+        if (n.status === 'disabled' || n.status === 'needs_review' || n.status === 'pending') blocked.push(n);
+        else injectable.push(n);
+    }
+    return { term: q, injectable, blocked };
+}
+
+/**
+ * 哪些节点的**关键词**会被"把 term 塞进扫描缓冲"这一招命中。
+ *
+ * 判据必须用 `term.includes(key)` 而不是反过来：ST 的命中条件是
+ * "扫描文本包含 key"（`world-info.js` L4793 起），而我们塞进缓冲的正是 term 本身。
+ * 反向写会把 `精灵向导缇娜` 误判成"能被「缇娜」命中"。
+ */
+export function keysMatching(state, term) {
+    const q = String(term ?? '').trim().toLowerCase();
+    if (!q) return [];
+    return recallableNodes(state).filter(n =>
+        n.status !== 'disabled' && n.status !== 'needs_review' && n.status !== 'pending'
+        && (n.keys || []).some(k => q.includes(String(k).toLowerCase())));
+}

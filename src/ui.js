@@ -19,7 +19,7 @@
 
 import { estimateTokens, fmtTokens } from './tokens.js';
 import { REASON_LABEL, TIER_LABEL, TIER_ORDER } from './entry.js';
-import { avgInjectedTokens, topHitNodes } from './store.js';
+import { avgInjectedTokens, topHitNodes, castIndex } from './store.js';
 import { SETTINGS_META, PLACEHOLDERS, unknownPlaceholders, isCustomPrompt, isCustomSkeletonPrompt } from './settings.js';
 
 export function escapeHtml(s) {
@@ -261,7 +261,29 @@ function bodyNodes(ctx) {
             : `<div class="lm-empty">书里还没有节点。点「立刻总结未总结的消息」把已有的聊天记录总结成节点，
             或打开「自动记忆」后正常聊天 —— 每满 ${ctx.settings.promptInterval} 条消息会自动总结一次。</div>`;
     }
-    return nodes.map(n => nodeRow(n, ctx)).join('') + topHits(ctx);
+    return castBar(ctx) + nodes.map(n => nodeRow(n, ctx)).join('') + topHits(ctx);
+}
+
+/**
+ * 「按角色召回」：实体召回的入口（`/lm-recall 人名` 的面板版）。
+ *
+ * 名字来自节点/骨架正文里的「谁在场」行，**不来自关键词** —— 这正是重点：
+ * 判别力闸门会把反复出场的配角名从关键词里剔掉（频率判据对"循环登场的配角"和
+ * "每回合都吐的机制词"给出同一个判决），但正文里的「谁在场」不受它影响。
+ * 所以多配角轮换的聊天里，这是把"某个配角之前发生了什么"捞回来的那条路。
+ */
+function castBar(ctx) {
+    const cast = castIndex(ctx.state);
+    if (!cast.length) return '';
+    return `
+    <div class="lm-cast">
+        <div class="lm-cast-head">按角色召回
+            <span class="lm-dim">点一个名字 = 把提到 ta 的节点全部注入本回合（即使最近没提到 ta）</span>
+        </div>
+        <div class="lm-cast-chips">
+            ${cast.map(c => `<button class="menu_button lm-mini lm-cast-chip" data-lm-cast="${escapeHtml(c.name)}" title="本回合注入提到「${escapeHtml(c.name)}」的 ${c.count} 个节点">${escapeHtml(c.name)} <b>${c.count}</b></button>`).join('')}
+        </div>
+    </div>`;
 }
 
 function bodySettings(ctx) {
@@ -330,7 +352,7 @@ function bodyHelp(ctx) {
         <tr><td><code>/lm-interval 12</code></td><td>设置每多少条消息总结一次</td></tr>
         <tr><td><code>/lm-scope all|char|user</code></td><td>设置总结时扫描哪些消息</td></tr>
         <tr><td><code>/lm-pin N003</code></td><td>强制某节点本回合注入一次</td></tr>
-        <tr><td><code>/lm-recall 魔界</code></td><td>没被提及也强行召回</td></tr>
+        <tr><td><code>/lm-recall 魔界</code></td><td>没被提及也强行召回；关键词已经覆盖不到的词（比如被剔掉的<b>配角名</b>）自动改成按正文召回</td></tr>
         <tr><td><code>/lm-status</code></td><td>状态摘要</td></tr>
         <tr><td><code>/lm-clear</code></td><td>删除本书全部记忆条目</td></tr>
         </tbody>
@@ -339,6 +361,18 @@ function bodyHelp(ctx) {
        摘要使用 ST 的<b>主 API</b>（<code>generateQuietPrompt</code>），不是你在「聊天补全」里选的那个源。</p>`;
 }
 
+/**
+ * 一行节点。
+ *
+ * ⚠️ 分隔符规则（2026-09-19 实地核对 ST 1.18.0 后定下，别再改回去）：
+ *   · **能被粘进 ST 世界书输入框的东西** 用英文逗号 —— ST 侧只认逗号：
+ *     `world-info.js` L2958 明文框 `key.join(', ')`、L2887 select2 `tokenSeparators: [',']`、
+ *     L2947 → L2717 `splitKeywordsAndRegexes()` 只按逗号切。
+ *     以前这里用 `join('、')`，用户从插件框里复制出去的 `A、B、C` 粘进 ST 会变成**一个**关键词。
+ *   · **在插件里读给人看的列表**（关键词 chip、被剔除词的提示、保存成功的 toast）保留顿号 ——
+ *     那是中文散文里的顿号，不会有人去复制它。
+ *   · **解析端继续兼容顿号**（见 index.js 的 saveNodeKeys）：中文用户手打顿号是本能，拒绝它是坏体验。
+ */
 function nodeRow(node, ctx) {
     const badge = STATUS_BADGE[node.status] || STATUS_BADGE.active;
     const tokens = node.tokens || estimateTokens(node.content);
@@ -364,7 +398,7 @@ function nodeRow(node, ctx) {
         ${!skeleton && (node.droppedKeys || []).length
             ? `<div class="lm-hint">已自动剔除判别力不足的关键词：${(node.droppedKeys || []).map(k => escapeHtml(k)).join('、')}（它们在别的剧情里也会命中，会造成误触发）</div>`
             : ''}
-        ${!skeleton ? `<div class="lm-keys-edit" hidden><input type="text" class="text_pole lm-key-input" data-lm-keys="${node.uid}" value="${escapeHtml((node.keys || []).join('、'))}" placeholder="用顿号或逗号分隔；留空 = 不再被关键词召回"></div>` : ''}
+        ${!skeleton ? `<div class="lm-keys-edit" hidden><input type="text" class="text_pole lm-key-input" data-lm-keys="${node.uid}" value="${escapeHtml((node.keys || []).join(', '))}" placeholder="用英文逗号分隔（顿号也认）；留空 = 不再被关键词召回"></div>` : ''}
         <div class="lm-node-meta">
             <span class="${overCap ? 'lm-over' : ''}">${fmtTokens(tokens)} / ${cap} token</span>
             <span>命中 ${node.hits || 0} 次</span>

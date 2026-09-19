@@ -319,6 +319,44 @@
     touch-action: pan-y;
 }
 
+/* ── 按角色召回（实体召回的入口，与「记忆节点」列表同区） ──
+   关键词那一列救不回来的配角记忆靠这里捞：点一个名字 = 把那几条节点强制注入本回合。 */
+.lm-cast {
+    margin: 0 0 8px;
+    padding: 7px 9px;
+    border: 1px solid rgba(110, 168, 254, 0.25);
+    border-radius: 5px;
+}
+
+.lm-cast-head {
+    font-size: 0.82em;
+    font-weight: 700;
+    margin-bottom: 6px;
+}
+
+.lm-cast-head .lm-dim { font-weight: 400; }
+
+/* 长聊里出场过的名字会很多（一次性 NPC 也算），所以这块**不截断、只限高滚动** ——
+   截断会把"偶尔才回来一次、但正需要捞记忆"的配角藏起来，那恰好是这功能要解决的情况。
+   max-height + overflow 的写法与 .lm-content 一致（移动端要 touch-action: pan-y）。 */
+.lm-cast-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    max-height: 96px;
+    overflow-y: auto;
+    touch-action: pan-y;
+}
+
+.lm-cast-chip {
+    font-size: 0.78em;
+    padding: 2px 8px;
+    border-radius: 10px;
+    cursor: pointer;
+}
+
+.lm-cast-chip b { opacity: 0.65; }
+
 .lm-tophits { display: flex; flex-wrap: wrap; gap: 5px; }
 
 .lm-hit-chip {

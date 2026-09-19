@@ -59,6 +59,8 @@ import {
     findNode,
     nodeByUid,
     recordTurn,
+    recallTargets,
+    keysMatching,
 } from './src/store.js';
 import { nodeEntryPatch, skeletonEntryPatch, inferReason, TIER_ORDER, TIER_LABEL } from './src/entry.js';
 import { DEMO_NODES, DEMO_SKELETON, checkKeys, dropIndiscriminativeKeys } from './src/seed.js';
@@ -1419,31 +1421,122 @@ async function onBooksModalClick(ev) {
 // ───────────────────────── 钉选与召回（FR-10） ─────────────────────────
 
 /**
- * 钉选：强制本回合注入一次。
+ * 强制注入一组条目（钉选 / 实体召回共用）。
  *
- * ⚠️ 实地核对 ST 1.18.0 源码后确认的一个陷阱（需求文档 §1.4/R8 未覆盖）：
- *    world-info.js L4774 `activatedNow.add(buffer.getExternallyActivated(entry))`
- *    —— 被注入的是**事件里传进来的那个对象本身**，而不是按 world.uid 回书里取条目。
- *    所以只传 `{ world, uid }` 会通过 L1022 的字段校验，却注入一条 content 为空的条目。
- *    正确做法：把书里那条**完整条目**（含 content/position/order/role…）传进去。
+ * ⚠️ 实地核对 ST 1.18.0 源码后确认的两件事：
+ *  ① world-info.js L4774 `activatedNow.add(buffer.getExternallyActivated(entry))`
+ *     —— 被注入的是**事件里传进来的那个对象本身**，而不是按 world.uid 回书里取条目。
+ *     所以只传 `{ world, uid }` 会通过 L1022 的字段校验，却注入一条 content 为空的条目。
+ *  ② 但 L4689 的 `entry.disable == true` 检查排在 L4774 **之前** —— 书里被禁用的条目
+ *     根本走不到强制注入那一支。本插件把「待确认 / 已禁用 / 已归档」都写成 disable:true，
+ *     所以它们**拉不进来**，只能如实告知（见 recallCast）。
+ *
+ * @param {number[]} uids
+ * @param {string} label 提示语里的动作名
+ */
+async function forceActivate(uids, label) {
+    const state = getState();
+    const list = [...new Set((uids || []).filter(Number.isInteger))];
+    if (!state || !state.bookName) { toast('还没有绑定世界书', 'warning'); return { ok: false, count: 0, tokens: 0 }; }
+    if (!list.length) return { ok: false, count: 0, tokens: 0 };
+
+    const data = await loadWorldInfo(state.bookName);
+    const clones = [];
+    const missing = [];
+    const disabled = [];
+    let tokens = 0;
+    for (const uid of list) {
+        const entry = data && data.entries ? data.entries[uid] : null;
+        if (!entry) { missing.push(uid); continue; }
+        if (entry.disable) { disabled.push(uid); continue; }
+        const clone = JSON.parse(JSON.stringify(entry));
+        clone.world = state.bookName;
+        clone.uid = uid;
+        clones.push(clone);
+        tokens += estimateTokens(entry.content);
+        forcedUids.add(uid);
+    }
+
+    if (!clones.length) {
+        toast(`${label}：没有可注入的条目${disabled.length ? `（${disabled.length} 条在书里是禁用状态）` : ''}`, 'warning');
+        return { ok: false, count: 0, tokens: 0, missing, disabled };
+    }
+
+    // 一次事件带上整批：ST 侧就是 `for (const entry of entries)`（L1021），
+    // 而且注入后仍走正常的预算/order 裁剪，不会把上下文冲爆。
+    await eventSource.emit(event_types.WORLDINFO_FORCE_ACTIVATE, clones);
+    const skipped = [
+        missing.length ? `${missing.length} 条不在书里` : '',
+        disabled.length ? `${disabled.length} 条已禁用` : '',
+    ].filter(Boolean);
+    toast(`${label}：本回合必定注入 ${clones.length} 条（约 ${tokens} token）${skipped.length ? `，跳过 ${skipped.join('、')}` : ''}`, 'success');
+    render();
+    return { ok: true, count: clones.length, tokens, missing, disabled };
+}
+
+/**
+ * 钉选：强制某节点本回合注入一次。
+ * @param {number} uid
  */
 async function pinNode(uid) {
     const state = getState();
     if (!state || !state.bookName) { toast('还没有绑定世界书', 'warning'); return; }
-    const data = await loadWorldInfo(state.bookName);
-    const entry = data && data.entries ? data.entries[uid] : null;
-    if (!entry) { toast(`找不到 uid ${uid} 的条目`, 'error'); return; }
-    if (entry.disable) { toast('该条目已禁用，先启用再钉选', 'warning'); return; }
-
-    const clone = JSON.parse(JSON.stringify(entry));
-    clone.world = state.bookName;
-    clone.uid = uid;
-    await eventSource.emit(event_types.WORLDINFO_FORCE_ACTIVATE, [clone]);
-    forcedUids.add(uid);
-
     const node = nodeByUid(state, uid);
-    toast(`已钉选：${node ? node.id + ' ' + node.title : 'uid ' + uid} —— 本回合必定注入（下一回合自动失效）`, 'success');
-    render();
+    return forceActivate([uid], `已钉选${node ? `：${node.id} ${node.title}` : ''}`);
+}
+
+/**
+ * 实体召回：把「正文提到这个词」的节点全部强制注入本回合。
+ *
+ * 为什么不能只靠 `/lm-recall` 那条老路：它只是把词塞进扫描缓冲，然后指望条目自带的
+ * **key** 命中 —— 而多配角轮换的场景里，配角名恰恰会被判别力闸门剔掉（见 src/store.js
+ * 顶部的实测数据）。这条路不看 key，只看正文，所以闸门怎么判都不影响它。
+ *
+ * @param {string} term 角色名（或任何词）
+ * @param {{via?:string}} opts
+ */
+async function recallCast(term, { via = '按角色召回' } = {}) {
+    const state = getState();
+    const q = String(term || '').trim();
+    if (!q) { toast('用法：/lm-recall 缇娜（点面板上的角色名也一样）', 'warning'); return { ok: false, message: '用法：/lm-recall 缇娜' }; }
+    if (!state || !state.bookName) { toast('还没有绑定世界书', 'warning'); return { ok: false, message: '还没有绑定世界书' }; }
+
+    const { injectable, blocked } = recallTargets(state, q);
+    if (!injectable.length) {
+        const message = blocked.length
+            ? `提到「${q}」的 ${blocked.length} 条节点是「待确认 / 已禁用」状态（书里 disable:true，强制注入也进不去）—— 先点「改关键词」补词恢复它们`
+            : `没有任何节点提到「${q}」`;
+        toast(message, 'warning');
+        return { ok: false, message, blocked: blocked.length };
+    }
+
+    const r = await forceActivate(injectable.map(n => n.uid), `${via}「${q}」`);
+    const ids = injectable.map(n => n.id).join(' ');
+    return {
+        ok: r.ok,
+        message: `${via}「${q}」→ ${ids}${blocked.length ? `（另有 ${blocked.length} 条待确认/已禁用被跳过）` : ''}`,
+        ids, count: r.count, tokens: r.tokens, blocked: blocked.length,
+    };
+}
+
+/**
+ * `/lm-recall <词>`：先走原生那条路，走不通才退化成实体召回。
+ * 保持"关键词还命中得了就只塞扫描缓冲"的老行为，是为了不悄悄改变已有语义与开销；
+ * 只有关键词已经覆盖不到时，才动用"按正文召回"这条会真花钱的路。
+ */
+async function recallByTerm(term) {
+    const q = String(term || '').trim();
+    if (!q) { toast('用法：/lm-recall 魔界', 'warning'); return '用法：/lm-recall 魔界'; }
+    const state = getState();
+    if (!state || !state.bookName) return '还没有绑定世界书';
+
+    const byKey = keysMatching(state, q);
+    if (byKey.length) {
+        recallKeys(q);
+        return `已把「${q}」塞入扫描缓冲：${byKey.length} 个节点的关键词仍会命中它（${byKey.map(n => n.id).join(' ')}）`;
+    }
+    const r = await recallCast(q, { via: '/lm-recall 实体召回' });
+    return r.message;
 }
 
 /**
@@ -1628,6 +1721,18 @@ async function onPanelClick(ev) {
             setDrawerState(drawerEl.dataset.lmDrawer, !wasOpen);
         }
         return;   // 折叠标题上不该有别的动作
+    }
+
+    // 「按角色召回」chip：它不带 uid，也不是 lm-action，单独处理
+    const castEl = ev.target.closest('[data-lm-cast]');
+    if (castEl) {
+        try {
+            await recallCast(castEl.dataset.lmCast);
+        } catch (e) {
+            console.error('[LoreMemory] 按角色召回失败', e);
+            toast(`召回失败：${e?.message || e}`, 'error');
+        }
+        return;
     }
 
     const btn = ev.target.closest('[data-lm-action]');
@@ -1904,12 +2009,10 @@ function registerCommands() {
 
     add({
         name: 'lm-recall',
-        callback: (_args, keys) => {
-            recallKeys(String(keys || ''));
-            return `已把「${keys}」塞入扫描缓冲`;
-        },
-        unnamedArgumentList: [new SlashCommandArgument('要强行召回的关键词', [ARGUMENT_TYPE.STRING], true)],
-        helpString: '即使最近消息里没提到这个词，也让相关记忆节点被激活（靠扩展注入并入世界书扫描缓冲）。',
+        callback: (_args, keys) => recallByTerm(String(keys || '')),
+        unnamedArgumentList: [new SlashCommandArgument('要强行召回的关键词，或一个人名', [ARGUMENT_TYPE.STRING], true)],
+        helpString: '即使最近消息里没提到这个词，也让相关记忆节点被激活。关键词还命中得了就走原生扫描缓冲；'
+            + '命中不了（比如反复出场的配角名被判别力闸门剔掉了）就自动改成按正文召回。',
         returns: ARGUMENT_TYPE.STRING,
     });
 
@@ -2022,6 +2125,8 @@ window.LoreMemory = {
     ...(DEVELOPER_BUILD ? { seedDemo } : {}),
     clearMemory, summarizePending, refreshSkeleton, resummarizeNode,
     pinNode, recallKeys, ensureBook, getSettings, updateSetting,
+    // 实体召回（按需那条路）：把"某个配角之前发生了什么"捞回来，不依赖关键词
+    recallCast, recallByTerm, forceActivate,
     cleanupEmptyBooks, isRealChatContext,
     // 管理聊天书（两个版本都有）
     openBooksModal, closeBooksModal, refreshBooksModal, listPluginBooks,
