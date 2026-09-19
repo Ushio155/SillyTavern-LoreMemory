@@ -196,10 +196,12 @@ function actions(ctx) {
     </div>`;
     }
 
-    const summarizeBtn = `<button class="menu_button lm-btn" data-lm-action="summarize"><i class="fa-solid fa-wand-magic-sparkles"></i> 立刻总结未总结的消息</button>`;
+    const summarizeBtn = `<button class="menu_button lm-btn lm-tone-amber" data-lm-action="summarize"><i class="fa-solid fa-wand-magic-sparkles"></i> 立刻总结未总结的消息</button>`;
     const refreshBtn = `<button class="menu_button lm-btn" data-lm-action="refresh"><i class="fa-solid fa-rotate"></i> 刷新</button>`;
     const clearBtn = `<button class="menu_button lm-btn lm-btn-danger" data-lm-action="clear"><i class="fa-solid fa-broom"></i> 清空记忆</button>`;
-    const booksBtn = `<button class="menu_button lm-btn" data-lm-action="books"><i class="fa-solid fa-book-bookmark"></i> 管理聊天书</button>`;
+    // 「世界书那一类入口」统一用条目关键词同款蓝色（字色 + 边框）：
+    // 插件里有两条通往世界书的路 —— 自己建的聊天书（管理聊天书）、和 ST 自带的那个面板。
+    const booksBtn = `<button class="menu_button lm-btn lm-tone-key" data-lm-action="books"><i class="fa-solid fa-book-bookmark"></i> 管理聊天书</button>`;
 
     if (!dev) {
         return `
@@ -221,7 +223,7 @@ function actions(ctx) {
         <button class="menu_button lm-btn lm-btn-block" data-lm-action="seed" ${state.demo ? 'disabled' : ''}><i class="fa-solid fa-flask"></i> ${state.demo ? '演示节点已灌入' : '灌入演示节点'}</button>
     </div>
     <div class="lm-actions lm-actions-tight">
-        <button class="menu_button lm-btn lm-btn-block" data-lm-action="books"><i class="fa-solid fa-book-bookmark"></i> 管理聊天书</button>
+        <button class="menu_button lm-btn lm-btn-block lm-tone-key" data-lm-action="books"><i class="fa-solid fa-book-bookmark"></i> 管理聊天书</button>
     </div>`;
 }
 
@@ -261,7 +263,40 @@ function bodyNodes(ctx) {
             : `<div class="lm-empty">书里还没有节点。点「立刻总结未总结的消息」把已有的聊天记录总结成节点，
             或打开「自动记忆」后正常聊天 —— 每满 ${ctx.settings.promptInterval} 条消息会自动总结一次。</div>`;
     }
-    return castBar(ctx) + nodes.map(n => nodeRow(n, ctx)).join('') + topHits(ctx);
+
+    // 分页（世界书同款）：长聊里节点会攒到几十条，全摊开在一列里既要滚很久、
+    // 又让"最新那条"和"最早那条"混在一起。每页条数与页码存在扩展的 ui 偏好里，跨重绘保留。
+    const sizes = Array.isArray(ctx.pager?.sizes) && ctx.pager.sizes.length ? ctx.pager.sizes : [10, 25, 50, 100];
+    const perPage = sizes.includes(Number(ctx.pager?.perPage)) ? Number(ctx.pager.perPage) : sizes[0];
+    const pages = Math.max(1, Math.ceil(nodes.length / perPage));
+    const page = Math.min(pages, Math.max(1, Number(ctx.pager?.page) || 1));
+    const from = (page - 1) * perPage;
+    const slice = nodes.slice(from, from + perPage);
+
+    return `
+    ${castBar(ctx)}
+    ${pagerBar({ page, pages, perPage, sizes, total: nodes.length, from, shown: slice.length })}
+    ${slice.map(n => nodeRow(n, ctx)).join('')}
+    ${pages > 1 ? pagerBar({ page, pages, perPage, sizes, total: nodes.length, from, shown: slice.length, bottom: true }) : ''}
+    ${topHits(ctx)}`;
+}
+
+/**
+ * 分页条：`10/page` 选择器 + 第 N/M 页 + 上一页/下一页。
+ * 选项文字照 ST 世界书面板的写法（`25/page`），用户一眼就知道是什么。
+ */
+function pagerBar({ page, pages, perPage, sizes, total, from, shown, bottom = false }) {
+    return `
+    <div class="lm-pager${bottom ? ' lm-pager-bottom' : ''}">
+        <select class="text_pole lm-select lm-page-size" data-lm-page-size="1" title="每页显示几条记忆节点">
+            ${sizes.map(s => `<option value="${s}" ${s === perPage ? 'selected' : ''}>${s}/page</option>`).join('')}
+        </select>
+        <span class="lm-dim lm-page-info">第 ${page}/${pages} 页 · 显示 ${from + 1}-${from + shown} 条 / 共 ${total} 条</span>
+        <span class="lm-page-nav">
+            <button class="menu_button lm-mini" data-lm-page="-1" ${page <= 1 ? 'disabled' : ''} title="上一页">上一页</button>
+            <button class="menu_button lm-mini" data-lm-page="1" ${page >= pages ? 'disabled' : ''} title="下一页">下一页</button>
+        </span>
+    </div>`;
 }
 
 /**
@@ -275,13 +310,20 @@ function bodyNodes(ctx) {
 function castBar(ctx) {
     const cast = castIndex(ctx.state);
     if (!cast.length) return '';
+    const pinned = ctx.pinnedUids instanceof Set ? ctx.pinnedUids : new Set();
     return `
     <div class="lm-cast">
         <div class="lm-cast-head">按角色召回
-            <span class="lm-dim">点一个名字 = 把提到 ta 的节点全部注入本回合（即使最近没提到 ta）</span>
+            <span class="lm-dim">点一个名字 = 把提到 ta 的节点全部注入下一次生成（即使最近没提到 ta）；再点一次取消</span>
         </div>
         <div class="lm-cast-chips">
-            ${cast.map(c => `<button class="menu_button lm-mini lm-cast-chip" data-lm-cast="${escapeHtml(c.name)}" title="本回合注入提到「${escapeHtml(c.name)}」的 ${c.count} 个节点">${escapeHtml(c.name)} <b>${c.count}</b></button>`).join('')}
+            ${cast.map(c => {
+        // 整组都挂着才算"已召回"：召回是按名字整批进出的，
+        // 组里只要还有一条没交付，这一枚就还是亮的（琥珀色 = 还挂着 / 已生效）。
+        const uids = Array.isArray(c.uids) ? c.uids : [];
+        const on = uids.length > 0 && uids.every(u => pinned.has(u));
+        return `<button class="menu_button lm-mini lm-cast-chip${on ? ' lm-is-on' : ''}" data-lm-cast="${escapeHtml(c.name)}" data-lm-on="${on ? '1' : '0'}" title="本回合注入提到「${escapeHtml(c.name)}」的 ${c.count} 个节点${on ? '（已召回：再点一次取消）' : ''}">${escapeHtml(c.name)} <b>${c.count}</b></button>`;
+    }).join('')}
         </div>
     </div>`;
 }
@@ -351,8 +393,8 @@ function bodyHelp(ctx) {
         <tr><td><code>/lm-auto on|off</code></td><td>开关自动记忆</td></tr>
         <tr><td><code>/lm-interval 12</code></td><td>设置每多少条消息总结一次</td></tr>
         <tr><td><code>/lm-scope all|char|user</code></td><td>设置总结时扫描哪些消息</td></tr>
-        <tr><td><code>/lm-pin N003</code></td><td>强制某节点本回合注入一次</td></tr>
-        <tr><td><code>/lm-recall 魔界</code></td><td>没被提及也强行召回；关键词已经覆盖不到的词（比如被剔掉的<b>配角名</b>）自动改成按正文召回</td></tr>
+        <tr><td><code>/lm-pin N003</code></td><td>强制某节点在下一次生成注入（再打一次取消）；面板上「钉选」按钮同样功效，生效中会亮成琥珀色</td></tr>
+        <tr><td><code>/lm-recall 魔界</code></td><td>没被提及也强行召回；关键词已经覆盖不到的词（比如被剔掉的<b>配角名</b>）自动改成按正文召回。这些"钉子"会一直挂着直到真的注入出去 —— 中间的自动摘要不会把它吃掉</td></tr>
         <tr><td><code>/lm-status</code></td><td>状态摘要</td></tr>
         <tr><td><code>/lm-clear</code></td><td>删除本书全部记忆条目</td></tr>
         </tbody>
@@ -381,6 +423,8 @@ function nodeRow(node, ctx) {
     // 导致 200~350 token 的**合法**骨架被误标红，而真正的 350 上限从不起作用。
     const cap = Number(skeleton ? ctx.settings.skeletonTokenCap : ctx.settings.nodeTokenCap) || (skeleton ? 350 : 200);
     const overCap = tokens > cap;
+    // 这一条是不是还钉着（钉子挂在 pinnedUids 上，交付出去才消失）→ 按钮点亮成琥珀色
+    const pinnedNode = ctx.pinnedUids instanceof Set && ctx.pinnedUids.has(node.uid);
 
     return `
     <div class="lm-node ${node.status === 'disabled' ? 'lm-node-off' : ''}" data-lm-uid="${node.uid}">
@@ -409,7 +453,7 @@ function nodeRow(node, ctx) {
             </select>` : `<span class="lm-dim">order ${TIER_ORDER.skeleton}</span>`}
         </div>
         <div class="lm-node-ops">
-            <button class="menu_button lm-mini" data-lm-action="pin" data-lm-uid="${node.uid}" title="强制注入一次（本回合生效）"><i class="fa-solid fa-thumbtack"></i> 钉选</button>
+            <button class="menu_button lm-mini lm-pin${pinnedNode ? ' lm-is-on' : ''}" data-lm-action="pin" data-lm-uid="${node.uid}" data-lm-on="${pinnedNode ? '1' : '0'}" title="${pinnedNode ? '已钉选：下一次生成必定带上它（再点一次取消）' : '强制注入一次（下一次生成生效）'}"><i class="fa-solid fa-thumbtack"></i> ${pinnedNode ? '已钉选' : '钉选'}</button>
             <button class="menu_button lm-mini" data-lm-action="toggle" data-lm-uid="${node.uid}">${node.status === 'disabled' ? '启用' : '禁用'}</button>
             <button class="menu_button lm-mini" data-lm-action="edit" data-lm-uid="${node.uid}">看正文</button>
             ${!skeleton ? `<button class="menu_button lm-mini" data-lm-action="edit-keys" data-lm-uid="${node.uid}" title="手工改关键词（改完失焦或回车保存）">改关键词</button>` : ''}
@@ -478,8 +522,12 @@ export function booksModalHtml(opts = {}) {
     const busy = !!opts.busy;
     const dis = busy ? ' disabled' : '';
     const mine = books.filter(b => b.plugin).length;
-    const collapsed = new Set(Array.isArray(opts.collapsedGroups) ? opts.collapsedGroups : []);
     const groups = groupBooks(books);
+    // `collapsedGroups === null/undefined` = 用户还没动过 ⇒ **所有分组默认折叠**。
+    // 一屏几十本同名角色卡的书铺开来根本找不到东西，先给"有哪几张卡"的概览。
+    // 显式给数组时按数组来（展开过的组不在里面 ⇒ 保持展开）。
+    const collapsedOpt = opts.collapsedGroups;
+    const collapsed = new Set(Array.isArray(collapsedOpt) ? collapsedOpt : groups.map(g => g.name));
 
     const body = books.length
         ? groups.map(g => bookGroupHtml(g, expanded, entries, collapsed.has(g.name))).join('')
