@@ -5,7 +5,9 @@
 # 记忆节点 · LoreMemory（Demo v0.2）
 
 > SillyTavern 第三方扩展｜目标宿主 **SillyTavern 1.18.0**
-> 仓库：**https://github.com/Ushio155/SillyTavern-LoreMemory**（开发分支 `dev`，当前也是默认分支）
+> 仓库：**https://github.com/Ushio155/SillyTavern-LoreMemory**
+> 分支：**`main` = 面向用户版**（默认分支，仓库根目录就是成品，装到就是这个）；
+> **`dev` = 开发者版源码**（多一个「灌入演示节点」；`build.mjs` 与 `release/` 只在它上面）
 > 这是需求文档《LoreMemory-世界书记忆插件-需求与运行逻辑.md》的**可运行演示版**，用来把"大概效果"
 > 变成"能点、能打字触发、能看账本"的东西。**不是成品**，详见下面的「这个 demo 做了什么/没做什么」。
 
@@ -13,12 +15,18 @@
 
 ## 两个版本：开发者版 / 面向用户版
 
-源码只有一份，`node build.mjs` 会产出两份可直接安装的包（在 `release/` 下）：
+源码只有一份，在 **`dev`** 分支上；`node build.mjs` 把它打成两份可直接安装的包（`dev` 的 `release/` 下）。
+**两个分支各自交付其中一份**：
 
-| 包 | 版本 | 界面差别 | 给谁 |
+| 分支（仓库根就是可安装的那一份） | 版本 | 界面差别 | 给谁 |
 |---|---|---|---|
-| `release/SillyTavern-LoreMemory-dev/` | `0.2.0-dev` | 多一个**整行**的「灌入演示节点」+ `/lm-seed` 命令 + 标题上的「开发版」徽标 | 开发/调试：不用真的聊满 N 楼就能看到效果（内置剧本） |
-| `release/SillyTavern-LoreMemory/` | `0.2.0` | **没有**演示入口，它原来那一格直接换成「管理聊天书」 | 真实用户 |
+| **`main`** ＝ `release/SillyTavern-LoreMemory/` | `0.2.0` | **没有**演示入口，它原来那一格直接换成「管理聊天书」 | 真实用户（默认分支，装到就是这个） |
+| **`dev`** ＝ `release/SillyTavern-LoreMemory-dev/` | `0.2.0-dev` | 多一个**整行**的「灌入演示节点」+ `/lm-seed` 命令 + 标题上的「开发版」徽标 | 开发/调试：不用真的聊满 N 楼就能看到效果（内置剧本） |
+
+> `main` 是**发布分支**，内容由 `dev` 上验证过的用户版产物生成
+> （生成树 = `release/SillyTavern-LoreMemory/**` + `.gitattributes`），
+> 所以它上面**没有** `build.mjs` 与 `release/` —— 打包工具跟着源码走。
+> `verify-remote.mjs` 会同时核对两个分支，`main` 一旦落后于 `dev` 的用户版就直接报 DIFF。
 
 两个版本的按钮区（**在「刷新 / 清空记忆」下面**；用户版是把演示键那一格换成「管理聊天书」，
 不是再加一行 —— 演示入口在用户包里根本不存在，空着那一格会留个洞）：
@@ -50,7 +58,8 @@
 
 **方式一：面板安装**
 
-`扩展程序`（魔法棒 🪄）→ `Install extension` → 填仓库地址，分支填 `dev`：
+`扩展程序`（魔法棒 🪄）→ `Install extension` → 填仓库地址，**分支留空就是 `main`（面向用户版）**；
+想要带演示入口的开发者版，把分支填成 `dev`：
 
 ```
 https://github.com/Ushio155/SillyTavern-LoreMemory
@@ -66,8 +75,9 @@ https://github.com/Ushio155/SillyTavern-LoreMemory
 
 （要求 `manifest.json` 就在该目录下——仓库根目录的结构就是按这个来的。）
 
-> 想装**面向用户版**：用 `release/SillyTavern-LoreMemory/` 那个文件夹（先 `node build.mjs` 生成）。
-> 仓库根目录这份源码是**开发者版**（含演示入口）。两者差别见上面「两个版本」一节。
+> **装到的是哪个版本，取决于你从哪个分支装**：`main`（默认）= 面向用户版成品，仓库根就是它；
+> `dev` = 开发者版源码（含演示入口）。在 `dev` 上想手工取用户版那份，用 `release/SillyTavern-LoreMemory/`
+> 文件夹（先 `node build.mjs` 生成）。两者差别见上面「两个版本」一节。
 
 装好后**刷新浏览器页面**。手机上 ST 的扩展同样适用；面板已做 ≤640px 的移动端适配
 （按钮两行等宽、设置行改为上下堆叠、输入框 16px 防 iOS 聚焦缩放）。
@@ -347,8 +357,9 @@ https://github.com/Ushio155/SillyTavern-LoreMemory
 > （`LoreMemory-Plugin\install.ps1`），作用是"把这份代码复制或联接进本机 ST 的扩展目录"，
 > 方便**一边改一边看**（它按"我在 `LoreMemory-Plugin\` 里"算路径，所以从仓库目录里跑是不成立的）。
 >
-> **普通用户不需要它** —— 用上面两种方式就行：ST 面板 `扩展程序` → `Install extension` 填本仓库地址、
-> 分支填 `dev`；或把整个文件夹手工放进 `SillyTavern/data/<用户名>/extensions/SillyTavern-LoreMemory/`。
+> **普通用户不需要它** —— 用上面两种方式就行：ST 面板 `扩展程序` → `Install extension` 填本仓库地址
+> （分支留空 = `main` = 面向用户版）；或把整个文件夹手工放进
+> `SillyTavern/data/<用户名>/extensions/SillyTavern-LoreMemory/`。
 
 ```powershell
 # 以下命令只在作者的工作区（LoreMemory-Plugin\）里可用
@@ -377,19 +388,32 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1 -SillyTavernPath 'E:\Sill
 
 ## 目录结构
 
+**`main`（发布分支 = 面向用户版）** —— 根目录就是可直接安装的扩展，`manifest.json` 版本 `0.2.0`：
+
 ```
-SillyTavern-LoreMemory/
-├─ manifest.json        ST 扩展清单（开发者版：0.2.0-dev）
+SillyTavern-LoreMemory/          ← main
+├─ manifest.json        0.2.0（面向用户版）
 ├─ index.js             唯一 import ST 内部模块的地方（相对路径的目录深度只写一次）
 ├─ lorememory.css       面板样式 + 「管理聊天书」弹窗（含 ≤640px 移动端适配）
+├─ README.md  LICENSE  AI-DISCLOSURE.md
+├─ .gitattributes       * text=auto eol=lf（保证 clone 下来的字节与这里一致）
+└─ src/                 全部是零依赖纯函数
+```
+
+**`dev`（开发分支 = 开发者版源码）** —— 比 `main` 多两样：`build.mjs` 与 `release/`。
+
+```
+SillyTavern-LoreMemory/          ← dev
+├─ manifest.json        0.2.0-dev（开发者版）
+├─ index.js  lorememory.css  README.md  LICENSE  AI-DISCLOSURE.md
 ├─ build.mjs            打包：同一份源码 → release/ 下的开发者版与面向用户版
 ├─ release/             打包产物（生成物，不要手改）
-│  ├─ SillyTavern-LoreMemory/      面向用户版：无演示入口，有「管理聊天书」
+│  ├─ SillyTavern-LoreMemory/      面向用户版 ← 与 main 分支的内容逐字节相同
 │  └─ SillyTavern-LoreMemory-dev/  开发者版：多一个整行的「灌入演示节点」
-├─ README.md
 └─ src/                 全部是零依赖纯函数，可在 Node 里直接跑回归
    ├─ build.js          唯一的构建开关 DEVELOPER_BUILD（两个版本只有这里不同）
-   ├─ store.js          chat_metadata 状态形状、归一化、账本、统计
+   ├─ store.js          chat_metadata 状态形状、归一化、账本、统计、角色索引与实体召回
+   ├─ settings.js       设置归一化 / 转录构建 / 提示词渲染 / 输出解析 / 兜底抽词
    ├─ entry.js          节点 → 世界书条目字段补丁（对齐 1.18.0 字段表）
    ├─ guard.js          骨架硬闸门（字段白名单 / 裁剪 / 拒收）
    ├─ context.js        「是不是真聊天」判定（欢迎屏空书的守卫）
@@ -446,7 +470,7 @@ SillyTavern-LoreMemory/
 | `repro-welcome.mjs` | 3 次刷新 | 专测「停在欢迎屏反复新建空书」这个真实 bug：修复后 `LM-*` 书数量恒定不增长 |
 | `ui-parity.mjs` | — | 在**面板真实所在的位置**（`#extensions_settings` 内、按 ST 自己的方式打开抽屉）量：外层容器不画盒子、标题行与同级扩展逐项同款；窄视口下的媒体查询 |
 | `check-encoding.mjs` | 62 文件 + 56 选择器 | 全量文本文件（含 **`.mjs` 套件脚本自己**）是合法 UTF-8、无 U+FFFD；**带非 ASCII 的 `.ps1` 必须带 UTF-8 BOM**（PS 5.1 会把无 BOM 的脚本按 ANSI 读，中文 `throw` 直接被解析成语法错误）；CSS 关键选择器齐全、大括号配平 |
-| `verify-remote.mjs` | 逐文件 | 远端 `dev` 每个 blob SHA 与本地逐一比对（证明远端跑的就是本地测过的那份） |
+| `verify-remote.mjs` | 逐文件 × 2 分支 | 远端 `dev` ↔ 本地仓库根、远端 **`main` ↔ `release/SillyTavern-LoreMemory/**`（+`.gitattributes`）**，逐个 blob SHA 比对 —— 证明"远端跑的就是本地测过的那份"，同时证明 `main` 没落后于 `dev` 的用户版 |
 | `screenshot.mjs` | — | 整屏 / 移动端截图（辅助出图，不参与判定） |
 
 `driver.mjs` 在**独立数据目录的实验室 ST 实例**（端口 8011）上跑，不碰你日常用的 ST 数据。
