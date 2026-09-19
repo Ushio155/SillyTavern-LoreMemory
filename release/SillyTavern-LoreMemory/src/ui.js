@@ -432,8 +432,9 @@ function settingRow(key, meta, value) {
  *            active = 当前聊天绑定的那本；plugin = 名字以 LM- 开头（插件建的，可删）
  *   expanded 展开的书名（null = 都收起）
  *   entries  展开那本的条目 [{ uid, comment, keys, content, constant, disable, order, tokens }]
+ *   collapsedGroups  收起的角色卡分组名（[] = 全展开）
  *
- * 所有交互都靠 data-lm-book-* 属性，由 index.js 在弹窗容器上做事件委托 ——
+ * 所有交互都靠 data-lm-book-* / data-lm-group-* 属性，由 index.js 在弹窗容器上做事件委托 ——
  * 整块重绘后不需要重新绑定监听器（和面板同一个套路）。
  */
 export function booksModalHtml(opts = {}) {
@@ -443,9 +444,11 @@ export function booksModalHtml(opts = {}) {
     const busy = !!opts.busy;
     const dis = busy ? ' disabled' : '';
     const mine = books.filter(b => b.plugin).length;
+    const collapsed = new Set(Array.isArray(opts.collapsedGroups) ? opts.collapsedGroups : []);
+    const groups = groupBooks(books);
 
     const body = books.length
-        ? books.map(b => bookRow(b, expanded, entries)).join('')
+        ? groups.map(g => bookGroupHtml(g, expanded, entries, collapsed.has(g.name))).join('')
         : '<div class="lm-empty">还没有插件建过的聊天书。点上面的「新增聊天书」，或回到面板点「启用记忆（建书并绑定）」。</div>';
 
     return `
@@ -453,9 +456,9 @@ export function booksModalHtml(opts = {}) {
     <div class="lm-modal-card" role="dialog" aria-modal="true" aria-label="管理聊天书">
         <div class="lm-modal-head">
             <span class="lm-modal-title"><i class="fa-solid fa-book-bookmark"></i> 管理聊天书</span>
-            <span class="lm-dim">${mine} 本插件建的${opts.activeName ? ` · 当前绑定 <code>${escapeHtml(opts.activeName)}</code>` : ' · 当前聊天未绑定'}</span>
-            <button class="menu_button lm-mini lm-modal-close" data-lm-book-close="1">关闭</button>
+            <button class="menu_button lm-mini lm-modal-close" data-lm-book-close="1" title="关闭"><i class="fa-solid fa-xmark"></i><span class="lm-close-label">关闭</span></button>
         </div>
+        <div class="lm-modal-summary lm-dim">${mine} 本插件建的${opts.activeName ? ` · 当前绑定 <code>${escapeHtml(opts.activeName)}</code>` : ' · 当前聊天未绑定'}</div>
         <div class="lm-modal-tools">
             <button class="menu_button lm-btn" data-lm-book-new="1"${dis}><i class="fa-solid fa-plus"></i> 新增聊天书</button>
             <button class="menu_button lm-btn" data-lm-action="cleanup-books"${dis}><i class="fa-solid fa-broom"></i> 清理空书</button>
@@ -470,6 +473,64 @@ export function booksModalHtml(opts = {}) {
             「清理空书」只删<b>名字以 <code>LM-</code> 开头、里面一条条目都没有、且当前聊天没绑定</b>的书 —— 有内容的一律不动。
             早期版本会把 ST 的欢迎屏（选角色卡那一屏）误当成聊天，每次刷新建一本空书，那些垃圾书就用它收拾。
             ${opts.devBuild ? '<br>（开发者版：这些书里可能有「灌入演示节点」写进去的内置剧本。）' : ''}
+        </div>
+    </div>`;
+}
+
+/**
+ * 从书名推出「同一张角色卡」的分组名。
+ *
+ * 书名的形状是 `LM-<角色卡名>-<聊天片段>`（见 index.js 的 ensureBook），重名时 ST 会补 `(2)`。
+ * 取 `LM-` 之后、**第一个 `-`** 之前的那一段：
+ *   `LM-林晚-林晚 - 202 (1)`                        → 林晚
+ *   `LM-无限精力驱魔师·百鬼淫行录-无限精力驱魔师· (2)` → 无限精力驱魔师·百鬼淫行录
+ *
+ * ⚠ 这里是**第一个** `-`，不是最后一个 —— 这一点是照着实机截图改回来的：
+ * 聊天 id 常常长成 `<角色名> - <日期>`（ST 给聊天文件起的名字），前 8 位里就带着 ` - `，
+ * 于是"最后一个 `-`"会把分组名切在日期那一段上，界面上显示成 `林晚-林晚`。
+ * 代价是角色卡名自己带 `-` 时会被切短（没有别处存角色名，这是这套命名下能做的最好推断）；
+ * 但"聊天 id 里有连字符"比"角色名里有连字符"常见得多，所以选第一个。
+ * 切不出来（不是 LM- 开头、或没有 `-`）时整本自成一组。
+ */
+export function bookGroupKey(name) {
+    const s = String(name ?? '').trim();
+    if (!s) return '(未命名)';
+    if (!s.startsWith('LM-')) return s;
+    const rest = s.slice(3);
+    const cut = rest.indexOf('-');
+    return (cut > 0 ? rest.slice(0, cut) : rest) || s;
+}
+
+/** 按角色卡分组（保持原有顺序：同一组的书必然是相邻的，因为名字前缀相同） */
+export function groupBooks(books) {
+    const map = new Map();
+    for (const b of Array.isArray(books) ? books : []) {
+        const key = bookGroupKey(b?.name);
+        if (!map.has(key)) map.set(key, []);
+        map.get(key).push(b);
+    }
+    return [...map.entries()].map(([name, list]) => ({ name, books: list }));
+}
+
+/** 一个角色卡分组：可折叠。同一张卡下聊过好几次时，书会越攒越多，全摊开会看不到头 */
+function bookGroupHtml(g, expanded, entries, collapsed) {
+    const key = escapeHtml(g.name);
+    const count = g.books.length;
+    const entryCount = g.books.reduce((n, b) => n + (Number(b.count) || 0), 0);
+    const tokens = g.books.reduce((n, b) => n + (Number(b.tokens) || 0), 0);
+    const hasActive = g.books.some(b => b.active);
+    const allEmpty = g.books.every(b => (Number(b.count) || 0) === 0);
+    return `
+    <div class="lm-book-group${collapsed ? ' lm-collapsed' : ''}" data-lm-group="${key}">
+        <div class="lm-group-head" data-lm-group-toggle="${key}" title="同一张角色卡下的聊天书收在这里，点一下折叠/展开">
+            <i class="fa-solid fa-circle-chevron-${collapsed ? 'down' : 'up'}"></i>
+            <span class="lm-group-name">${key}</span>
+            ${hasActive ? '<span class="lm-badge lm-badge-ok">当前聊天在这组</span>' : ''}
+            ${allEmpty ? '<span class="lm-badge lm-badge-warn">都是空书</span>' : ''}
+            <span class="lm-dim">${count} 本 · ${entryCount} 条目 · ${fmtTokens(tokens)} token</span>
+        </div>
+        <div class="lm-group-body">
+            ${g.books.map(b => bookRow(b, expanded, entries)).join('')}
         </div>
     </div>`;
 }

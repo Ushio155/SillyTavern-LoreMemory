@@ -1071,7 +1071,7 @@ async function cleanupEmptyBooks() {
  * 弹窗状态。不进存档 —— 关掉页面就该忘掉（不像面板的折叠状态，那个要跨重绘保留）。
  * `entries` 是当前展开那本书的条目缓存，`books` 是列表快照。
  */
-const booksModal = { open: false, books: [], activeName: '', expanded: null, entries: [], error: '', busy: false };
+const booksModal = { open: false, books: [], activeName: '', expanded: null, entries: [], error: '', busy: false, collapsedGroups: [] };
 
 /** 弹窗容器（惰性创建，挂在 body 上） */
 function booksModalRoot() {
@@ -1167,8 +1167,18 @@ function renderBooksModal() {
         entries: booksModal.entries,
         busy: booksModal.busy,
         error: booksModal.error,
+        collapsedGroups: booksModal.collapsedGroups,
         devBuild: DEVELOPER_BUILD,
     });
+}
+
+/** 折叠 / 展开一个角色卡分组（分组名就是这本书名里推出来的角色卡名） */
+function toggleBookGroup(name) {
+    if (!name) return;
+    const set = new Set(booksModal.collapsedGroups);
+    if (set.has(name)) set.delete(name); else set.add(name);
+    booksModal.collapsedGroups = [...set];
+    renderBooksModal();
 }
 
 /** 重新读一遍列表（展开状态尽量保留） */
@@ -1373,6 +1383,9 @@ async function onBooksModalClick(ev) {
             return;
         }
         if (hit('data-lm-book-new')) { await createBookForCurrentChat(); await refreshBooksModal(); return; }
+
+        const group = hit('data-lm-group-toggle');
+        if (group) { toggleBookGroup(group.dataset.lmGroupToggle); return; }
 
         const view = hit('data-lm-book-view');
         if (view) { await toggleBookView(view.dataset.lmBookView); return; }

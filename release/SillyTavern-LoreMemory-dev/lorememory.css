@@ -510,6 +510,16 @@
     flex: 0 0 auto;
 }
 
+/* 标题栏：用**实心主题色**（`--SmartThemeQuoteColor`，就是用户在 ST 主题里设的那个强调色）。
+ *
+ * 为什么必须实心：手机上标题栏是 sticky 的，下滚的正文会从它底下经过 ——
+ * 标题栏一旦透明，两层文字就叠在一起（用户截图里「管理聊天书」和「清理空书」糊成一团）。
+ * 顺手也解决了"透明度配比不协调"：实心色块 + 一条细边框，边界清楚，不靠半透明去猜。
+ * 这条照抄 CardLore 的 `.cardlore_header`（它们也是这个变量，所以颜色跟着用户自己的主题走）。 */
+.lm-modal-head {
+    background: var(--SmartThemeQuoteColor, #2a2a2a);
+}
+
 .lm-modal-foot {
     border-bottom: none;
     border-top: 1px solid rgba(127, 127, 127, 0.25);
@@ -517,13 +527,31 @@
 }
 
 .lm-modal-title { font-weight: 700; }
-.lm-modal-head .lm-dim {
-    flex: 1 1 auto;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+
+/* 关闭按钮推到最右，手机上只留一个 ✕（仿 CardLore 的标题栏）。
+ * 选择器带满三个类：关闭按钮同时也带 lm-mini，而 `.lm-modal-root .menu_button.lm-mini { margin: 0 }`
+ * 在后面、权重相同 —— 少写一个类就被它压掉，按钮会黏在标题右边。 */
+.lm-modal-root .menu_button.lm-mini.lm-modal-close { margin-left: auto; }
+.lm-modal-close i { margin-right: 4px; }
+
+/* 摘要行（几本、当前绑的是哪本）：从标题栏里挪出来单独一行。
+ * 标题栏越干净越好 —— sticky 那一块只该有「这是什么 + 怎么关」。 */
+.lm-modal-summary {
+    flex: 0 0 auto;
+    padding: 7px 12px;
+    border-bottom: 1px solid rgba(127, 127, 127, 0.25);
+    background: rgba(127, 127, 127, 0.08);
+    overflow-wrap: anywhere;
 }
+
+.lm-modal-summary code,
+.lm-group-head code {
+    background: rgba(127, 127, 127, 0.2);
+    padding: 1px 4px;
+    border-radius: 3px;
+    font-size: 0.95em;
+}
+
 .lm-modal-tools-hint { font-size: 0.8em; }
 
 .lm-modal-body {
@@ -533,6 +561,31 @@
     overscroll-behavior: contain;
     touch-action: pan-y;
 }
+
+/* ── 细滚动条 ──
+ * 手机上基本只用滑动，不需要一条能按住拖的宽槽：宽槽既挤窄内容，
+ * 又会在页面边缘露出后面那层界面（用户的要求是"页面填满整屏"）。
+ * 6px 是还能看见"我在哪一屏"的最小宽度；Firefox 走 scrollbar-width。 */
+.lm-modal-root,
+.lm-modal-body {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(127, 127, 127, 0.5) transparent;
+}
+
+.lm-modal-root::-webkit-scrollbar,
+.lm-modal-body::-webkit-scrollbar { width: 6px; height: 6px; }
+
+.lm-modal-root::-webkit-scrollbar-track,
+.lm-modal-body::-webkit-scrollbar-track { background: transparent; }
+
+.lm-modal-root::-webkit-scrollbar-thumb,
+.lm-modal-body::-webkit-scrollbar-thumb {
+    background: rgba(127, 127, 127, 0.5);
+    border-radius: 3px;
+}
+
+.lm-modal-root::-webkit-scrollbar-thumb:hover,
+.lm-modal-body::-webkit-scrollbar-thumb:hover { background: rgba(127, 127, 127, 0.75); }
 
 /* 浮层里的按钮：把面板那份「对抗宿主」的写法再写一遍（作用域不同，不能复用） */
 .lm-modal-root .menu_button.lm-btn {
@@ -569,6 +622,39 @@
     margin-bottom: 8px;
     background: rgba(127, 127, 127, 0.07);
 }
+
+/* ── 角色卡分组（同一张卡下聊过好几次时，书会越攒越多） ──
+ * 组头是折叠开关；组体用一条左边线表示"这些书属于上面那张卡"。 */
+.lm-book-group { margin-bottom: 10px; }
+
+.lm-book-group:last-child { margin-bottom: 0; }
+
+.lm-group-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 8px;
+    border-radius: 6px;
+    background: rgba(127, 127, 127, 0.14);
+    cursor: pointer;
+    font-weight: 600;
+    user-select: none;
+}
+
+.lm-group-head:hover { background: rgba(127, 127, 127, 0.2); }
+
+.lm-group-head i { font-size: 0.9em; opacity: 0.8; }
+
+.lm-group-name { min-width: 0; overflow-wrap: anywhere; }
+
+.lm-group-body {
+    margin-top: 6px;
+    padding-left: 8px;
+    border-left: 2px solid rgba(127, 127, 127, 0.25);
+}
+
+.lm-book-group.lm-collapsed .lm-group-body { display: none; }
 
 .lm-book-active {
     border-color: rgba(76, 175, 125, 0.55);
@@ -783,11 +869,10 @@
 
     /* 「管理聊天书」弹窗：窄屏下书名不省略号截断（用户要靠它认出是哪本书）。
      * 弹窗本身在手机上换成"一整页"，规则在文件末尾的 ≤768px 那条里 —— 那里更靠后，会盖住这里的排版。 */
-    .lm-modal-head .lm-dim {
+    .lm-modal-summary {
         white-space: normal;
         overflow: visible;
         flex-basis: 100%;
-        order: 3;
     }
 
     .lm-book-head .lm-dim { margin-left: 0; }
@@ -813,18 +898,33 @@
      *   ① 卡片那块不透明底色只铺到 844px，往下滚就没有底了；
      *   ② 更明显的是头部吸顶失效：sticky 只能在**包含块（卡片）**范围内粘，
      *      卡片一屏高 ⇒ 滚过一屏头部就被带出视野（实测 y=-650），关闭按钮就够不着了。 */
-    .lm-modal-root.lm-open { align-items: flex-start; }
+    .lm-modal-root.lm-open {
+        align-items: flex-start;
+        /* 整页模式没有"外面"可点，遮罩留着只会让边缘透出后面那层界面。
+           改成容器自己带不透明底色 —— 于是"页面填满整屏"，滚到哪儿都不会透。 */
+        background-color: #1c1c22;
+        background-image: linear-gradient(var(--SmartThemeBlurTintColor, #1c1c22), var(--SmartThemeBlurTintColor, #1c1c22));
+    }
+
+    .lm-modal-backdrop { display: none; }
+
+    /* 手机上只留 ✕：标题栏就那一行，别让「关闭」两个字占地方。
+     * 同样要把 lm-mini 一起写上 —— `.lm-modal-root .menu_button.lm-mini` 的 padding 在后面会压过它。 */
+    .lm-modal-root .menu_button.lm-mini.lm-modal-close { padding: 6px 10px; font-size: 1.05em; }
+    .lm-modal-root .lm-modal-close .lm-close-label { display: none; }
+    .lm-modal-close i { margin-right: 0; }
 
     .lm-modal-card {
         width: 100%;
+        /* 内容比一屏短时也要占满整屏，别在下面露出底色断层 */
+        min-height: 100%;
         max-height: none;
         margin: 0;
         border: 0;
         border-radius: 0;
         box-shadow: none;
-        /* 头部吸顶要求卡片底色**不透明**：主题的 BlurTint 多数带 alpha，
-           直接拿它当底色会让正文从吸顶头部底下透出来。
-           用「渐变层 = 主题色」压在「纯色兜底」上：主题有色就跟随，没色也保证不透明。 */
+        /* 头部吸顶要求底色**不透明**：主题的 BlurTint 多数带 alpha，直接拿它当底色会让
+           正文从吸顶头部底下透出来。用「渐变层 = 主题色」压在「纯色兜底」上：跟随主题又不透明。 */
         background-color: #1c1c22;
         background-image: linear-gradient(var(--SmartThemeBlurTintColor, #1c1c22), var(--SmartThemeBlurTintColor, #1c1c22));
         /* 吸顶头部要相对**弹窗**这个滚动容器生效，所以卡片自己不能裁切 */
@@ -838,6 +938,8 @@
         padding: 10px 12px;
     }
 
+    .lm-modal-summary { padding: 7px 12px; }
+
     .lm-modal-tools, .lm-modal-foot { padding: 8px 12px; }
 
     .lm-modal-body {
@@ -846,6 +948,9 @@
         overflow: visible;
         padding: 10px 12px calc(14px + env(safe-area-inset-bottom, 0px));
     }
+
+    /* 分组体在窄屏少缩进一点，把宽度留给书名 */
+    .lm-group-body { padding-left: 6px; }
 
     .lm-modal-root .menu_button.lm-btn { padding: 7px 12px; }
     .lm-modal-root .menu_button.lm-mini { padding: 5px 9px; }
