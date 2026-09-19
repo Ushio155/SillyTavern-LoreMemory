@@ -79,7 +79,16 @@ export function nodeEntryPatch(node, settings = {}) {
         matchWholeWords: null,
         // 条目级扫描深度：高频人物节点可调高（不动全局设置）
         scanDepth: hot ? numOrNull(settings.scanDepthHot, 8) : null,
-        group: groupFor(node),
+        // 分组：**无条件留空**，这不是"默认关"，是设计上不分组。
+        // ⚠️ 实测结论（ST 1.18.0）：inclusion group 是**组内竞争、赢家通吃** ——
+        // `filterByInclusionGroups()` 在组内按评分排序后只保留一条，其余直接出局。
+        // 只有 5 条节点时，分组会让"提到了 A 却注入了同组的 B"这种反直觉结果出现
+        // （本插件第一次端到端跑通时就踩到了：提到「魔界」注入的却是 N004）。
+        // 需求文档 §2.5 建议按 arc 归组，那是节点多到需要抢预算时的策略，要做得重新设计。
+        // 曾经这里写过 `groupFor(node)`，按节点上的 `groupWithArc` 开关决定归不归组 ——
+        // 但**全仓没有任何地方写那个开关**（设置界面没有、摘要输出不带、store 白名单不认），
+        // 等于一条永远为假的死路、只会误导后来的人，2026-09-19 删掉。
+        group: '',
         groupWeight: 100,
         groupOverride: false,
         useGroupScoring: null,
@@ -148,19 +157,6 @@ export function commentFor(node) {
     const range = (Number.isFinite(node.from) && Number.isFinite(node.to)) ? `${node.from}-${node.to}楼` : '';
     const title = String(node.title || '').trim();
     return [id, range, title].filter(Boolean).join(' · ');
-}
-
-/**
- * 同一 arc 的节点归组，避免一次注入好几条同段内容。
- *
- * ⚠️ 实测结论（ST 1.18.0）：inclusion group 是**组内竞争、赢家通吃** ——
- * `filterByInclusionGroups()` 在组内按评分排序后只保留一条，其余直接出局。
- * 演示默认**关闭分组**：只有 5 条节点时，分组会让"提到了 A 却注入了同组的 B"这种
- * 反直觉结果出现（本插件第一次端到端跑通时就踩到了：提到「魔界」注入的却是 N004）。
- * 需求文档 §2.5 建议按 arc 归组，那是节点多到需要抢预算时的策略，故保留开关、默认关。
- */
-function groupFor(node) {
-    return node.groupWithArc && node.arc ? `arc:${node.arc}` : '';
 }
 
 function numOrNull(v, fallback) {

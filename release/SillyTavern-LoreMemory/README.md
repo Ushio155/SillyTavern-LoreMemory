@@ -85,7 +85,8 @@ https://github.com/Ushio155/SillyTavern-LoreMemory
 >
 > 结论：**换版本必须换掉 `public` 里那份**。只往用户目录丢一份新的是没用的 ——
 > 这正是"两份副本、界面里生效的说不清"这个坑的另一半。
-> `install.ps1` 会**先清掉旧副本再装**，`-Release user|dev` 用来选装哪个包。
+> 作者工作区里的本地脚本 `install.ps1` 会**先清掉旧副本再装**，`-Release user|dev` 用来选装哪个包
+> （它不在本仓库里，见文末「安装 / 卸载」的说明）。
 
 ---
 
@@ -325,7 +326,16 @@ https://github.com/Ushio155/SillyTavern-LoreMemory
 
 ## 安装 / 卸载
 
+> ℹ️ **这一节说的是"作者工作区里的本地脚本"，仓库里没有它。** `install.ps1` 住在仓库的**上一层**
+> （`LoreMemory-Plugin\install.ps1`），作用是"把这份代码复制或联接进本机 ST 的扩展目录"，
+> 方便**一边改一边看**（它按"我在 `LoreMemory-Plugin\` 里"算路径，所以从仓库目录里跑是不成立的）。
+>
+> **普通用户不需要它** —— 用上面两种方式就行：ST 面板 `扩展程序` → `Install extension` 填本仓库地址、
+> 分支填 `dev`；或把整个文件夹手工放进 `SillyTavern/data/<用户名>/extensions/SillyTavern-LoreMemory/`。
+
 ```powershell
+# 以下命令只在作者的工作区（LoreMemory-Plugin\）里可用
+
 # 复制安装（默认；改代码后需重新运行）
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 
