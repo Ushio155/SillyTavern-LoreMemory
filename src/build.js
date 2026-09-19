@@ -15,7 +15,7 @@
  * 手改这一行也可以，但改完请跑 `node .lorememory-test/check-build.mjs`：
  * 它会核对 release/ 里的产物和源码是否一致。
  */
-export const DEVELOPER_BUILD = true;
+export const DEVELOPER_BUILD = false;
 
 /** 版本标签，只用于面板与日志（真正的版本号在 manifest.json） */
 export const BUILD_LABEL = DEVELOPER_BUILD ? '开发者版' : '用户版';
