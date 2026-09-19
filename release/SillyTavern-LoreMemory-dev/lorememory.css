@@ -441,7 +441,23 @@
     --lm-key: #6ea8fe;
     display: none;
     position: fixed;
-    inset: 0;
+    /* ⚠ 绝对不能用 `inset: 0`。ST 给 <html> 加了 `-webkit-transform: translateZ(0)`（style.css），
+     * html 因此成为 fixed 后代的**包含块** —— 手机视口下 `inset: 0` 量出来是 **390×0**
+     * （实测：root 高 0 ⇒ 卡片跟着塌成 0×0 ⇒ 弹窗在手机上等于不存在，DOM 里明明有书有条目）。
+     * 必须用显式视口单位；vw/vh 不受 transform 祖先影响。dvh 是移动端地址栏伸缩的动态视口，
+     * 不支持时自动回退到上一行的 vh（同一属性写两遍就是这个意思）。
+     * （这条是照 CardLore 踩过的同一个坑抄的结论，它们的 .cardlore_popup 注释里记着。） */
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    height: 100dvh;
+    /* 兜底滚动：卡片比视口高时（窄屏/横屏/字体放大）弹窗自己可滚，底部按钮永远够得着 */
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    /* 对抗 ST mobile-styles.css 的 body { touch-action: none } —— 不写这条手机上划不动 */
+    touch-action: pan-y;
+    -webkit-overflow-scrolling: touch;
     /* 必须压过 ST 自己那一票 29999 的浮层
      * （`#options, #extensionsMenu, .popup .popper-modal`，见 style.css:1081-1085，带 backdrop-filter），
      * 否则卡片会被那层模糊遮罩盖住 —— 实测踩到过：卡片在 DOM 里、几何也对（880×765 就在视口中央），
@@ -451,10 +467,11 @@
     font-size: 1em;
 }
 
+/* 居中交给卡片的 `margin: auto`，不用 align-items/justify-content：
+ * 卡片比容器高时，flex 居中会把**顶部**裁掉且滚不到（经典坑），auto 边距则会退化成顶部对齐，
+ * 靠上面的 overflow-y 滚到全部内容。 */
 .lm-modal-root.lm-open {
     display: flex;
-    align-items: center;
-    justify-content: center;
 }
 
 /* 点遮罩关闭。position:absolute 而不是 fixed，是为了跟着卡片一起被 inset 约束 */
@@ -471,6 +488,9 @@
     flex-direction: column;
     width: min(880px, calc(100% - 24px));
     max-height: min(85vh, 780px);
+    max-height: min(85dvh, 780px);
+    /* 见上面 `.lm-modal-root.lm-open` 的注释：居中靠 auto 边距，不靠 flex 的 align-items */
+    margin: auto;
     background: var(--SmartThemeBlurTintColor, #1c1c22);
     border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.18));
     border-radius: 8px;
@@ -761,16 +781,8 @@
     .lm-settings-block .lm-num-input { width: 90px; }
     .lm-prompt-textarea { min-height: 150px; }
 
-    /* 「管理聊天书」弹窗：窄屏几乎占满整屏，正文区自己滚 */
-    .lm-modal-card {
-        width: calc(100% - 12px);
-        max-height: 92vh;
-    }
-
-    .lm-modal-head, .lm-modal-tools { padding: 8px; }
-    .lm-modal-body { padding: 8px; }
-
-    /* 书名在窄屏不省略号截断，改成换行显示 —— 用户要靠它认出是哪本书 */
+    /* 「管理聊天书」弹窗：窄屏下书名不省略号截断（用户要靠它认出是哪本书）。
+     * 弹窗本身在手机上换成"一整页"，规则在文件末尾的 ≤768px 那条里 —— 那里更靠后，会盖住这里的排版。 */
     .lm-modal-head .lm-dim {
         white-space: normal;
         overflow: visible;
@@ -780,4 +792,61 @@
 
     .lm-book-head .lm-dim { margin-left: 0; }
     .lm-book-entries { max-height: none; }
+}
+
+/* ── 手机上「管理聊天书」不做弹窗，直接给一整页（仿 CardLore 的「一键生成」页） ──
+ *
+ * 起因：手机视口下弹窗**整块是 0 高**（实测 root 390×0、卡片 0×0；DOM 里有 2 本书 6 条条目，
+ * 屏幕上什么都没有）。根因是宿主那条 transform（见 .lm-modal-root 的注释），已经用显式视口单位修掉。
+ *
+ * 但光修高度还不够：手机上"880px 宽的卡片 + 卡片内部再滚"依然难受 ——
+ * 嵌套滚动在部分手机浏览器/WebView 上会失效，底部按钮经常够不着，键盘弹起时更乱。
+ * 所以窄屏直接换成一整页（CardLore 在真机上验证过的做法）：
+ *   · 外层 = **唯一的**滚动容器；卡片自然高度、去掉边框圆角阴影
+ *   · 头部 sticky 吸顶 ⇒ 关闭按钮永远在视野里
+ *   · 正文不再自己滚（flex: none + overflow: visible），跟着整页一起滚
+ *   · 底部留 safe-area，别被 iPhone 那条小黑条压住
+ *   · 触控区比桌面大一档（手机上 5px 内边距的按钮太小） */
+@media (max-width: 768px) {
+    /* 关键：卡片必须按**内容**长高，不能被 flex 拉伸成"一屏高"。
+     * 拉伸过的卡片只有 844px 高，而内容有 2253px —— 后果有两个：
+     *   ① 卡片那块不透明底色只铺到 844px，往下滚就没有底了；
+     *   ② 更明显的是头部吸顶失效：sticky 只能在**包含块（卡片）**范围内粘，
+     *      卡片一屏高 ⇒ 滚过一屏头部就被带出视野（实测 y=-650），关闭按钮就够不着了。 */
+    .lm-modal-root.lm-open { align-items: flex-start; }
+
+    .lm-modal-card {
+        width: 100%;
+        max-height: none;
+        margin: 0;
+        border: 0;
+        border-radius: 0;
+        box-shadow: none;
+        /* 头部吸顶要求卡片底色**不透明**：主题的 BlurTint 多数带 alpha，
+           直接拿它当底色会让正文从吸顶头部底下透出来。
+           用「渐变层 = 主题色」压在「纯色兜底」上：主题有色就跟随，没色也保证不透明。 */
+        background-color: #1c1c22;
+        background-image: linear-gradient(var(--SmartThemeBlurTintColor, #1c1c22), var(--SmartThemeBlurTintColor, #1c1c22));
+        /* 吸顶头部要相对**弹窗**这个滚动容器生效，所以卡片自己不能裁切 */
+        overflow: visible;
+    }
+
+    .lm-modal-head {
+        position: sticky;
+        top: 0;
+        z-index: 2;
+        padding: 10px 12px;
+    }
+
+    .lm-modal-tools, .lm-modal-foot { padding: 8px 12px; }
+
+    .lm-modal-body {
+        flex: none;
+        min-height: 0;
+        overflow: visible;
+        padding: 10px 12px calc(14px + env(safe-area-inset-bottom, 0px));
+    }
+
+    .lm-modal-root .menu_button.lm-btn { padding: 7px 12px; }
+    .lm-modal-root .menu_button.lm-mini { padding: 5px 9px; }
 }
