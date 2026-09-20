@@ -20,8 +20,8 @@
 
 | 分支（仓库根就是可安装的那一份） | 版本 | 界面差别 | 给谁 |
 |---|---|---|---|
-| **`main`** ＝ `release/SillyTavern-LoreMemory/` | `0.2.0` | **没有**演示入口，它原来那一格直接换成「管理聊天书」 | 真实用户（默认分支，装到就是这个） |
-| **`dev`** ＝ `release/SillyTavern-LoreMemory-dev/` | `0.2.0-dev` | 多一个**整行**的「灌入演示节点」+ `/lm-seed` 命令 + 标题上的「开发版」徽标 | 开发/调试：不用真的聊满 N 楼就能看到效果（内置剧本） |
+| **`main`** ＝ `release/SillyTavern-LoreMemory/` | `0.2.1` | **没有**演示入口，它原来那一格直接换成「管理聊天书」 | 真实用户（默认分支，装到就是这个） |
+| **`dev`** ＝ `release/SillyTavern-LoreMemory-dev/` | `0.2.1-dev` | 多一个**整行**的「灌入演示节点」+ `/lm-seed` 命令 + 标题上的「开发版」徽标 | 开发/调试：不用真的聊满 N 楼就能看到效果（内置剧本） |
 
 > `main` 是**发布分支**，内容由 `dev` 上验证过的用户版产物生成
 > （生成树 = `release/SillyTavern-LoreMemory/**` + `.gitattributes`），
@@ -90,8 +90,8 @@ https://github.com/Ushio155/SillyTavern-LoreMemory
 > - 但浏览器**真正收到的字节来自 `public`**：`app.use(express.static(public))`（`src/server-main.js:242`）
 >   挂在用户扩展路由（`src/users.js:1219`：先查用户目录、找不到才回落 `public`）**之前**，
 >   只要 `public` 里有同名文件，静态中间件就先把它发出去了。
-> - **实测**（`driver.mjs` 的 `[I]` 段把这条钉成了断言）：用户目录放 `0.2.0`、`public` 放 `0.2.0-dev` 时，
->   `discover` 报 `local`，而页面里跑的仍是 **`0.2.0-dev`**，面板上照旧有演示按钮。
+> - **实测**（`driver.mjs` 的 `[I]` 段把这条钉成了断言）：用户目录放 `0.2.1`、`public` 放 `0.2.1-dev` 时，
+>   `discover` 报 `local`，而页面里跑的仍是 **`0.2.1-dev`**，面板上照旧有演示按钮。
 >
 > 结论：**换版本必须换掉 `public` 里那份**。只往用户目录丢一份新的是没用的 ——
 > 这正是"两份副本、界面里生效的说不清"这个坑的另一半。
@@ -462,11 +462,11 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1 -SillyTavernPath 'E:\Sill
 
 ## 目录结构
 
-**`main`（发布分支 = 面向用户版）** —— 根目录就是可直接安装的扩展，`manifest.json` 版本 `0.2.0`：
+**`main`（发布分支 = 面向用户版）** —— 根目录就是可直接安装的扩展，`manifest.json` 版本 `0.2.1`：
 
 ```
 SillyTavern-LoreMemory/          ← main
-├─ manifest.json        0.2.0（面向用户版）
+├─ manifest.json        0.2.1（面向用户版）
 ├─ index.js             唯一 import ST 内部模块的地方（相对路径的目录深度只写一次）
 ├─ lorememory.css       面板样式 + 「管理聊天书」弹窗（含 ≤640px 移动端适配）
 ├─ README.md  LICENSE  AI-DISCLOSURE.md
@@ -478,7 +478,7 @@ SillyTavern-LoreMemory/          ← main
 
 ```
 SillyTavern-LoreMemory/          ← dev
-├─ manifest.json        0.2.0-dev（开发者版）
+├─ manifest.json        0.2.1-dev（开发者版）
 ├─ index.js  lorememory.css  README.md  LICENSE  AI-DISCLOSURE.md
 ├─ build.mjs            打包：同一份源码 → release/ 下的开发者版与面向用户版
 ├─ release/             打包产物（生成物，不要手改）
