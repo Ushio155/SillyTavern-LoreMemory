@@ -338,6 +338,7 @@ function bodySettings(ctx) {
     return `
     <div class="lm-setting-grid">${rows}</div>
 
+    ${inputBarSettingBlock(ctx)}
     <div class="lm-prompt-block">
         <div class="lm-prompt-head">
             <span class="lm-field-label">摘要提示词 ${custom ? '<span class="lm-badge lm-badge-warn">已自定义</span>' : '<span class="lm-badge lm-badge-tier">默认</span>'}</span>
@@ -369,6 +370,95 @@ function bodySettings(ctx) {
 
     <div class="lm-actions lm-actions-tight">
         <button class="menu_button lm-btn" data-lm-action="refresh-skeleton"><i class="fa-solid fa-id-card"></i> 立刻刷新骨架现状卡</button>
+    </div>`;
+}
+
+/**
+ * 输入框上方那条「角色召回条」的**内容**（纯函数，离线可测）。
+ *
+ * 外层容器（`#lm_cast_bar`）由 index.js 建一次并挂进 `#send_form`，这里只产出里面两层：
+ *   · `.lm-cast-strip` —— 真正放名字的那层，放不下的会被 index.js 按实测宽度**藏起来**
+ *   · `.lm-cast-more`  —— 「+N」，**独立于裁剪区**的一个 flex 项
+ *
+ * 为什么「+N」必须在裁剪区外面：只靠 `overflow:hidden` 时，被裁掉的最后一个元素就是它自己 ——
+ * 于是"还有名字"这件事变得不可见，用户既看不到也点不到。这是这一条最容易写错的地方，
+ * 实测（.lorememory-test/ui-probe.mjs）确认过：20 个名字 + nowrap 时，尾巴上的名字会被整段裁掉。
+ *
+ * @param {Array<{name:string,count?:number,on?:boolean,why?:string}>} rows rankCast 的输出
+ */
+export function inputBarHtml(rows) {
+    const list = Array.isArray(rows) ? rows : [];
+    if (!list.length) return '';
+    return `
+    <div class="lm-cast-strip">${list.map(inputBarChip).join('')}</div>
+    <button class="lm-chip lm-cast-more" data-lm-more="1" hidden>+0</button>`;
+}
+
+/** 一枚名字 chip（召回状态 = 琥珀色，和面板、钉选同一套语义色） */
+function inputBarChip(r) {
+    const on = !!r.on;
+    const title = `${r.name}：提到 ta 的节点 ${Number(r.count) || 0} 个 · 排序依据：${r.why || '—'}`
+        + (on ? ' · 已召回（再点一次取消）' : ' · 点一下把提到 ta 的节点全部召回下一次生成');
+    return `<button class="lm-chip${on ? ' lm-is-on' : ''}" data-lm-cast="${escapeHtml(r.name)}" data-lm-on="${on ? '1' : '0'}" title="${escapeHtml(title)}">${escapeHtml(r.name)}</button>`;
+}
+
+/**
+ * 「+N」弹窗的内容：**全部**名字，按同一套"最可能想召回"的顺序排列，带一个过滤框。
+ *
+ * 存在的理由就是"名字比位置稀缺"：bar 上放不下的那些不能只是消失。这里每个名字都点得到，
+ * 而且排在前面的就是最可能想要的 —— 所以"点开 +N"的成本从"找名字"降到"确认一下"。
+ */
+export function castPopupHtml(rows) {
+    const list = Array.isArray(rows) ? rows : [];
+    return `
+    <div class="lm-cast-popup">
+        <div class="lm-cast-popup-head">
+            <input type="text" class="text_pole lm-cast-filter" data-lm-cast-filter="1" placeholder="过滤名字…" autocomplete="off">
+            <span class="lm-dim">共 ${list.length} 个名字 · 顺序 = 你最可能想召回的排在前面</span>
+        </div>
+        <div class="lm-cast-popup-list" data-lm-cast-list="1">${list.map(castPopupRow).join('')}</div>
+    </div>`;
+}
+
+function castPopupRow(r) {
+    const on = !!r.on;
+    return `
+        <div class="lm-cast-row${on ? ' lm-is-on' : ''}" data-lm-cast="${escapeHtml(r.name)}" data-lm-on="${on ? '1' : '0'}" tabindex="0" role="button">
+            <span class="lm-cast-row-name">${escapeHtml(r.name)}</span>
+            <span class="lm-dim lm-cast-row-why">${Number(r.count) || 0} 条 · ${escapeHtml(r.why || '')}</span>
+            <span class="lm-cast-row-state">${on ? '已召回 · 点一下取消' : '点一下召回'}</span>
+        </div>`;
+}
+
+/**
+ * 「生成设置」抽屉里那条召回条的开关。
+ *
+ * 为什么不放进 SETTINGS_META：那不是生成参数，不进 normalizeSettings（与分页偏好同一个理由）——
+ * 它是"我怎么看"，存在 `extension_settings.LoreMemory.ui` 里，换聊天不该变。
+ */
+function inputBarSettingBlock(ctx) {
+    const p = ctx.uiPrefs || {};
+    const on = p.inputBar !== false;
+    const max = Number(p.inputBarMax) || 8;
+    const options = (Array.isArray(p.inputBarMaxChoices) ? p.inputBarMaxChoices : [4, 6, 8, 12])
+        .map(n => `<option value="${n}" ${n === max ? 'selected' : ''}>${n} 个</option>`).join('');
+    return `
+    <div class="lm-prompt-block lm-inputbar-block">
+        <div class="lm-prompt-head">
+            <span class="lm-field-label">输入框上方的角色召回条</span>
+        </div>
+        <div class="lm-set-row">
+            <label class="lm-set-label">在输入框上方显示</label>
+            <div class="lm-set-control"><input type="checkbox" data-lm-ui="inputBar" ${on ? 'checked' : ''}></div>
+            <div class="lm-hint lm-set-hint">点一个名字 = 把提到 ta 的记忆节点召回下一次生成（和你聊天里没提到 ta 也照样带上）。</div>
+        </div>
+        <div class="lm-set-row">
+            <label class="lm-set-label">最多显示几个名字</label>
+            <div class="lm-set-control"><select class="text_pole lm-select" data-lm-ui="inputBarMax">${options}</select></div>
+            <div class="lm-hint lm-set-hint">
+                屏幕放不下时会显示得更少，剩下的收进 <b>+N</b> 里（点开是全部名字，按"你最可能想召回的"排序）。
+            </div>
+        </div>
     </div>`;
 }
 

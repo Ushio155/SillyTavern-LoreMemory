@@ -394,6 +394,171 @@
 
 .lm-cast-chip b { opacity: 0.65; }
 
+/* ── 输入框上方的「角色召回条」 ──
+ *
+ * 挂点与 DeepSeek 余额插件同款：`#send_form` 是 flex-wrap 容器，`order:-1` 让它排在最前
+ * （`#file_form:0` → `#qr--bar:1` → `#nonQRFormItems:25`）。
+ *
+ * 四条**实测**约束（真页面探针量的，见 index.js 顶部注释与 实现发现-对需求文档的修正.md 发现 15）：
+ *  ① 宽度体制只有两种写法，写错就是两种坏结果：
+ *     · 不共用一行时 `width:100%` —— 余额条自己是 width:100%，我们若用 basis 0 会被挤成 **0 宽**；
+ *     · 共用一行时 `flex:1 1 0`（basis 0）—— 用内容宽（basis auto）会被 flex 换行判定为"放不下"而**永远另起一行**。
+ *  ② 名字**永远不换行**：不锁 nowrap 时 20 个名字会让这条自己变 2 行，输入框整体从 83px 涨到 129px。
+ *  ③ 多的名字靠"隐藏 + 「+N」出口"，不靠裁切：只锁 nowrap 会让 20 个名字里的 9 个**看不见也点不到**。
+ *  ④ 智能排序在 JS 里（rankCast）：可见位置稀缺，谁占哪个位置才是这个功能好不好用的全部。
+ *
+ * `--lm-*` 调色板要自带一份：这条挂在 `#send_form` 里，不在 `.lm-settings-block` 的作用域内
+ * （和「管理聊天书」弹窗同一个理由，见下面 `.lm-modal-root` 的注释）。 */
+#lm_cast_bar {
+    --lm-ok: #4caf7d;
+    --lm-warn: #f2c94c;
+    --lm-bad: #d94b4b;
+    --lm-key: #6ea8fe;
+    order: -1;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    /* align-self 必须：负下边距 + `#send_form` 默认的 align-items:center 会让文字被顶出上边框 */
+    align-self: flex-start;
+    flex: 0 1 auto;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    box-sizing: border-box;
+    padding: 5px 8px 0;
+    margin-bottom: -3px;
+    font-size: calc(var(--mainFontSize, 15px) * 0.85);
+    line-height: 1.25;
+    color: var(--SmartThemeBodyColor, #e6e6e6);
+    white-space: nowrap;
+    user-select: none;
+}
+
+/* 与余额条共用一行：把余额条收窄到内容宽，我们这条换成 basis 0 的弹性项。
+ * 只碰 `.ds-balance-bar` 一个选择器 —— 绝不碰 `#nonQRFormItems`，那是输入行本身。 */
+#send_form.lm-cast-shared > #lm_cast_bar {
+    flex: 1 1 0;
+    width: auto;
+    justify-content: flex-end;
+}
+
+#send_form.lm-cast-shared > .ds-balance-bar {
+    width: auto;
+    min-width: 0;
+    max-width: 60%;
+}
+
+/* 名字那一层。`overflow:hidden` 只是最后一道保险（正常情况下 index.js 已经按实测宽度把放不下的藏掉了） */
+#lm_cast_bar .lm-cast-strip {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+}
+
+/* 名字 chip。刻意**不用** `.menu_button`：主题里 `.menu_button{width:min-content}` 会把中文标签
+ * 压成"一字一行"的竖条（余额插件那份技术总结 §6.1 记着这个坑，实测 27×92px）。 */
+#lm_cast_bar .lm-chip {
+    flex: 0 0 auto;
+    width: auto;
+    max-width: 9em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    padding: 1px 7px;
+    border: 1px solid var(--SmartThemeBorderColor, rgba(127, 127, 127, 0.4));
+    border-radius: 999px;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    line-height: 1.3;
+    cursor: pointer;
+}
+
+#lm_cast_bar .lm-chip:hover {
+    border-color: var(--SmartThemeQuoteColor, currentColor);
+}
+
+/* ⚠ 这条不是装饰，是功能：`hidden` 属性靠 UA 的 `[hidden]{display:none}` 生效，
+ * 而我们上面给 `.lm-chip` 写了 `display:inline-flex`（同优先级、作者样式在后）—— 直接把 UA 规则压掉了。
+ * 后果实测过：被"藏起来"的名字仍然画在条上，超出部分被 `.lm-cast-strip` 的 overflow:hidden 裁掉，
+ * 于是既点不到、又让 `+N` 的数字对不上（量到 stripScroll 906 / stripW 223）。
+ * 任何给 chip 加 display 的规则都必须配一条这个。 */
+#lm_cast_bar .lm-chip[hidden],
+#lm_cast_bar .lm-cast-more[hidden] {
+    display: none;
+}
+
+/* 生效中（已召回）＝ 琥珀色，与面板里的钉选 / 按角色召回同一套语义色 */
+#lm_cast_bar .lm-chip.lm-is-on {
+    color: var(--lm-warn) !important;
+    border-color: var(--lm-warn) !important;
+    background: rgba(242, 201, 76, 0.12);
+}
+
+/* 「+N」：**独立 flex 项**，永远在裁剪区外面 —— 它要是也被裁掉，"还有更多名字"就没人看得见了 */
+#lm_cast_bar .lm-cast-more {
+    border-style: dashed;
+    opacity: 0.85;
+}
+
+/* ── 「+N」弹窗（内容挂在 ST 的 callGenericPopup 里，同样自带一份调色板） ── */
+.lm-cast-popup {
+    --lm-ok: #4caf7d;
+    --lm-warn: #f2c94c;
+    --lm-bad: #d94b4b;
+    --lm-key: #6ea8fe;
+}
+
+.lm-cast-popup-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.lm-cast-filter {
+    flex: 1 1 160px;
+    min-width: 120px;
+}
+
+.lm-cast-popup-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-height: 46vh;
+    overflow-y: auto;
+    touch-action: pan-y;
+}
+
+.lm-cast-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    padding: 5px 8px;
+    border: 1px solid var(--SmartThemeBorderColor, #555);
+    border-radius: 5px;
+    cursor: pointer;
+}
+
+.lm-cast-row:hover { border-color: var(--SmartThemeQuoteColor, currentColor); }
+
+.lm-cast-row.lm-is-on {
+    color: var(--lm-warn);
+    border-color: var(--lm-warn);
+    background: rgba(242, 201, 76, 0.12);
+}
+
+.lm-cast-row-name { font-weight: 700; }
+.lm-cast-row-state { margin-left: auto; font-size: 0.86em; opacity: 0.85; }
+
 /* ── 「记忆节点」分页条 ──
  * 长聊里节点会攒到几十条，一列全摊开既难滚也找不到东西。做法照 ST 世界书面板：
  * 左边「25/page」选择器，中间"第 N/M 页 · 显示 a-b 条 / 共 c 条"，右边上一页/下一页。
