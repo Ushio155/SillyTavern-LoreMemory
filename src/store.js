@@ -248,21 +248,88 @@ function mentions(node, term) {
  *
  * `uids` 是这些节点的 uid，面板用它判断"这一枚 chip 是不是正挂着"（命中即整组召回，
  * 所以按角色召回的状态是**整组**的：组里还有一条没交付，chip 就还是亮的）。
+ *
+ * `last` 是"最后出现在第几楼"（取命中节点区间的末端）—— 输入框上方那条召回条用它排"最近出场"，
+ * 见 `rankCast`。没有楼层号的老数据退回节点序号，保证它永远是正数（0 会被当成"没出现过"）。
  */
 export function castIndex(state) {
     const nodes = recallableNodes(state);
     const names = new Set();
     for (const n of nodes) for (const name of nodeCastNames(n)) names.add(name);
+    const floorOf = new Map(nodes.map((n, i) => {
+        const to = Number(n && n.to);
+        return [n, Number.isFinite(to) && to > 0 ? to : i + 1];
+    }));
     const out = [];
     for (const name of names) {
         const needle = name.toLowerCase();
         const hits = nodes.filter(n => mentions(n, needle));
         if (hits.length > 0) {
-            out.push({ name, count: hits.length, uids: hits.map(n => n.uid).filter(Number.isInteger) });
+            out.push({
+                name,
+                count: hits.length,
+                uids: hits.map(n => n.uid).filter(Number.isInteger),
+                last: hits.reduce((mx, n) => Math.max(mx, floorOf.get(n) || 0), 0),
+            });
         }
     }
     // 排序不用 localeCompare：断言要跨环境稳定（Node 与无头 Edge 的排序规则未必一致）
     return out.sort((a, b) => (b.count - a.count) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+}
+
+/**
+ * 输入框上方那条召回条的排序：**名字比位置稀缺**。
+ *
+ * 一条 bar 在桌面也就放得下 8~10 个名字，而长聊里出场过的名字可以到几十个 ——
+ * 所以"哪些名字占据可见的那几个位置"本身就是这个功能好不好用的全部。
+ * 光按"提到它的节点数"排会踩到用户报的那个坑：**你反复要召回的配角被挤进「+N」**，
+ * 于是每次都得点开弹窗找一遍。这里按"你现在最可能想召回谁"排：
+ *
+ *   0 召回中    —— 已经挂着的必须可见（否则没法再点一次取消）
+ *   1 正在输入  —— 输入框里正在打的名字：命中即置顶，打完字它就在那儿了
+ *   2 刚召回    —— 本次会话里你最近点过的（MRU）：点过一次，下次就跳到前排
+ *   3 最近出场  —— 最近几条消息里出现过的（含**还没总结**的尾部），按最后出现的楼层倒序
+ *   4 其余      —— 最近被总结进节点（last 大）优先，并列时节点多的优先
+ *
+ * 前三条是"意图信号"，第四条是"戏份信号"。每一条都带 `why` 标签，界面把它写进 tooltip／
+ * 弹窗行里 —— 排序依据必须看得见，否则就成了用户猜不透的"智能"。
+ *
+ * @param {Array<{name:string,count?:number,uids?:number[],last?:number}>} cast castIndex 的输出
+ * @param {{pinnedUids?:Set<number>|number[], typed?:string, recentText?:string, mru?:string[]}} signals
+ * @returns {Array<{name:string,count:number,uids:number[],last:number,on:boolean,why:string}>}
+ */
+export function rankCast(cast, signals = {}) {
+    const pinned = signals.pinnedUids instanceof Set ? signals.pinnedUids : new Set(signals.pinnedUids || []);
+    const typed = String(signals.typed || '').toLowerCase();
+    const recent = String(signals.recentText || '').toLowerCase();
+    const mruAt = new Map();
+    (Array.isArray(signals.mru) ? signals.mru : []).forEach((n, i) => {
+        const k = String(n || '').toLowerCase();
+        if (k && !mruAt.has(k)) mruAt.set(k, i);
+    });
+
+    const rows = (Array.isArray(cast) ? cast : []).map(c => {
+        const name = String(c.name || '');
+        const nameL = name.toLowerCase();
+        const uids = Array.isArray(c.uids) ? c.uids : [];
+        const on = uids.length > 0 && uids.every(u => pinned.has(u));
+        let why;
+        if (on) why = '召回中';
+        else if (typed && typed.includes(nameL)) why = '正在输入';
+        else if (mruAt.has(nameL)) why = '刚召回';
+        else if (recent && recent.includes(nameL)) why = '最近出场';
+        else if (Number(c.last) > 0) why = '最近总结';
+        else why = '节点最多';
+        return { name, count: Number(c.count) || 0, uids, last: Number(c.last) || 0, on, why };
+    });
+
+    const tier = (r) => r.on ? 0 : r.why === '正在输入' ? 1 : r.why === '刚召回' ? 2 : r.why === '最近出场' ? 3 : 4;
+    return rows.sort((a, b) => {
+        const ta = tier(a), tb = tier(b);
+        if (ta !== tb) return ta - tb;
+        if (ta === 2) return mruAt.get(a.name.toLowerCase()) - mruAt.get(b.name.toLowerCase());
+        return (b.last - a.last) || (b.count - a.count) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+    });
 }
 
 /**

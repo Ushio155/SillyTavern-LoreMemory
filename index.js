@@ -61,6 +61,8 @@ import {
     recordTurn,
     recallTargets,
     keysMatching,
+    castIndex,
+    rankCast,
 } from './src/store.js';
 import { nodeEntryPatch, skeletonEntryPatch, inferReason, TIER_ORDER, TIER_LABEL } from './src/entry.js';
 import { DEMO_NODES, DEMO_SKELETON, checkKeys, dropIndiscriminativeKeys } from './src/seed.js';
@@ -79,7 +81,7 @@ import {
     fitTranscriptByTokens,
     clampTranscriptTokens,
 } from './src/settings.js';
-import { renderPanel, booksModalHtml, escapeHtml, bookGroupKey } from './src/ui.js';
+import { renderPanel, booksModalHtml, escapeHtml, bookGroupKey, inputBarHtml, castPopupHtml } from './src/ui.js';
 import { isRealChatContext, noChatReason } from './src/context.js';
 // 版本开关：true = 开发者版（多一个「灌入演示节点」），false = 面向用户版（只有「管理聊天书」）
 import { DEVELOPER_BUILD, BUILD_LABEL } from './src/build.js';
@@ -971,6 +973,8 @@ async function onChatChanged() {
     // 钉子是按 uid 记的，换了聊天就是另一本书里的另一批 uid —— 必须清掉，
     // 否则上一个聊天的钉选会打到新聊天的同名 uid 上。
     pinnedUids.clear();
+    // 「最近点过召回的名字」同理：名字在不同聊天里指的不是同一批角色
+    recentCast.length = 0;
     clearRecall();
     if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
 
@@ -1073,6 +1077,7 @@ async function clearMemory() {
     // 条目删完了，面板状态也要跟着清零（和「删除聊天书」共用同一段：少一处漏改）
     resetMemoryState(state);
     pinnedUids.clear();   // 钉子指向的条目已经不在书里了
+    recentCast.length = 0;
     persist();
     render();
     toast('已清空记忆条目', 'success');
@@ -1704,6 +1709,9 @@ async function recallCast(term, { via = '按角色召回', toggle = true } = {})
     }
     for (const c of r.clones) pinnedUids.add(c.uid);
     await eventSource.emit(event_types.WORLDINFO_FORCE_ACTIVATE, r.clones);
+    // 记进"最近点过"的名单：输入框上方那条会把它排到前排，
+    // 于是"反复要召回的配角每次都被挤进 +N"这件事不会发生（见 rankCast）。
+    rememberCast(q);
     toast(`${via}「${q}」：已排队 ${r.clones.length} 条（约 ${r.tokens} token），下一次生成必定带上；再点一次可取消`, 'success');
     render();
     return {
@@ -1794,6 +1802,421 @@ function onScanDone(args) {
     if (released) console.debug(`[LoreMemory] 本次扫描交付了 ${released} 条钉选/召回`);
 }
 
+// ───────────────────── 输入框上方的「角色召回条」 ─────────────────────
+//
+// 为什么要有它：面板里那块「按角色召回」在「扩展程序」抽屉深处，长聊里想起某个配角
+// 得先拉开抽屉再翻列表。这条把入口搬到输入框上方（挂点与 DeepSeek 余额插件同款：
+// `#send_form` 本身就是 flex-wrap 容器，宽 100% 的子元素独占一行），点名字 = 召回下一次生成。
+//
+// 四条**实测**事实决定了实现方式（真页面探针 .lorememory-test/ui-probe.mjs 量的，
+// 数字记在 实现发现-对需求文档的修正.md 发现 15 / §6）：
+//  · 余额插件的 `.ds-balance-bar` 是 `width:100%` 的 flex 项 → **它永远独占一行**。
+//    想共用一行必须由我们把它的宽度收窄（`#send_form.lm-cast-shared > .ds-balance-bar`）；
+//    收窄后实测同一行：余额 169px 在左、我们这条在右，输入框总高 105.4 → 83.4px。
+//  · 只锁 `flex-wrap:nowrap` 不会变厚，但会把多的名字**裁掉**（20 个名字时只剩 11 个可见）。
+//  · 名字挤不下又不锁 nowrap 时，这条自己变 2 行、输入框整体 129.3px（比 1 行多 46px）—— 用户报的"臃肿"。
+//  · 窄屏 320px 下余额条占 143px，共用一行只剩 ~79px（1 个名字）→ 那种情况主动放弃共用、退回独立一行。
+
+const CAST_BAR_ID = 'lm_cast_bar';
+const INPUT_BAR_MAX_CHOICES = [4, 6, 8, 12];
+const DEFAULT_INPUT_BAR_MAX = 8;
+/** 与余额条共用一行时，至少要有几个名字的位置；不够就退回独立一行（手机上反而看得更多） */
+const MIN_SHARED_SLOTS = 3;
+/** 「最近出场」看最近几条消息（含还没总结的尾部） */
+const RECENT_MSG_WINDOW = 8;
+const RECENT_CAST_CAP = 8;
+const TYPING_DEBOUNCE_MS = 150;
+
+/**
+ * 本次会话里最近点过召回的名字（最近的在前）。
+ *
+ * 这是"高频角色被挤进 +N、每次都要点开"那个问题的直接解药：被点过一次的名字下次排在前面。
+ * 只在内存里 —— 它是"这一次聊天里我顺手点的顺序"，跟着聊天走，切聊天/清空时丢掉。
+ */
+const recentCast = [];
+
+/** 最近一次渲染时排好序的全量名字（「+N」弹窗按同一顺序列出来） */
+let castRows = [];
+/**
+ * 名字来源的覆盖（测试 / 调试用）：
+ *   undefined → 沿用上一次的来源（默认是聊天状态）
+ *   Array     → 用这份名单（离线套件与 driver 不需要真的灌节点就能量布局）
+ *   null      → 丢掉覆盖，回到聊天状态
+ * 打字重排必须沿用同一份来源，否则"打名字 → 它跳到最前"这条在无状态的页面里量不出来。
+ */
+let castOverride;
+let castLayoutRaf = 0;
+let castBarObserver = null;
+let castTypingTimer = 0;
+
+function getInputBarPrefs() {
+    const holder = extension_settings[MODULE_NAME] || (extension_settings[MODULE_NAME] = {});
+    if (!holder.ui || typeof holder.ui !== 'object') holder.ui = { drawers: {} };
+    const p = holder.ui.inputBar;
+    const on = !(p && p.on === false);
+    const rawMax = Number(p && p.max);
+    holder.ui.inputBar = { on, max: INPUT_BAR_MAX_CHOICES.includes(rawMax) ? rawMax : DEFAULT_INPUT_BAR_MAX };
+    return holder.ui.inputBar;
+}
+
+function setInputBarPref(patch = {}) {
+    const p = getInputBarPrefs();
+    if (patch.on !== undefined) p.on = !!patch.on;
+    if (patch.max !== undefined) {
+        const n = Number(patch.max);
+        p.max = INPUT_BAR_MAX_CHOICES.includes(n) ? n : DEFAULT_INPUT_BAR_MAX;
+    }
+    saveSettingsDebounced();
+    return p;
+}
+
+function rememberCast(name) {
+    const n = String(name || '').trim();
+    if (!n) return;
+    const i = recentCast.findIndex(x => x.toLowerCase() === n.toLowerCase());
+    if (i >= 0) recentCast.splice(i, 1);
+    recentCast.unshift(n);
+    if (recentCast.length > RECENT_CAST_CAP) recentCast.length = RECENT_CAST_CAP;
+}
+
+/** 输入框里正在打的字 —— 排序里权重最高的**意图**信号（见 rankCast） */
+function inputBarTypedText() {
+    const ta = document.getElementById('send_textarea');
+    return ta && typeof ta.value === 'string' ? ta.value : '';
+}
+
+/** 最近几条消息的正文（含还没被总结的尾部）—— "现在戏份在谁身上"的信号 */
+function recentChatText() {
+    const chat = chatMessages();
+    return chat.slice(-RECENT_MSG_WINDOW).map(m => String((m && m.mes) || '')).join('\n').slice(-4000);
+}
+
+/** 余额插件那一行：两种放置（框内 / #form_sheld 兜底）都要认出来 */
+function balanceBarIn(host) {
+    if (!host) return null;
+    for (const el of host.children) {
+        if (el.id === 'ds_balance_bar' || el.classList.contains('ds-balance-bar')) return el;
+    }
+    return null;
+}
+
+/**
+ * `#send_form` 现在是不是**竖排**容器。
+ *
+ * 为什么必须问这一句（driver [M] 手机视口那段实测抓到的）：
+ * 竖排容器里"并排"是伪命题 —— 共用一行要用的 `flex:1 1 0` 量的是**高度**，
+ * 于是我们这条被拉成 185.75px 高、输入框整体 211px，比"各占一行"还厚一倍多。
+ * 实测 390px 视口下 `#send_form` 的计算值就是 `flex-direction: column`
+ * （核心 style.css:891 只写了 display:flex + flex-wrap:wrap，column 来自手机侧/主题的叠加）。
+ * 所以收窄余额条那套只在**横排**时启用；竖排一律退回独立一行（宽度 100%，正好是我们要的）。
+ */
+function isStackedForm(host) {
+    try {
+        const dir = getComputedStyle(host).flexDirection;
+        return dir === 'column' || dir === 'column-reverse';
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * 把这条挂进 `#send_form`（幂等）。
+ *
+ * 顺序不能靠"谁先挂"：同为 `order:-1` 时按文档序排，而余额插件是 `prepend` 的 ——
+ * 它先挂了就在左、我们在右（正是"名字挤到右边"要的效果）。但如果我们先挂、
+ * 它后来 prepend，位置关系仍然成立；反过来若两边都用 append 就会反过来。
+ * 所以这里显式一点：**有余额条就插在它后面**，没有就 append（append 不会影响
+ * `#file_form` / `#nonQRFormItems` 的排布，它们的 order 是 0/1/25）。
+ */
+function mountInputBar() {
+    const host = document.getElementById('send_form');
+    const existing = document.getElementById(CAST_BAR_ID);
+    if (existing && host) {
+        if (existing.parentElement !== host) host.append(existing);   // ST 重绘过 → 挪回来
+        const bal = balanceBarIn(host);
+        if (bal && bal.nextElementSibling !== existing) bal.after(existing);
+        return existing;
+    }
+    if (!host) return null;
+
+    const bar = document.createElement('div');
+    bar.id = CAST_BAR_ID;
+    bar.className = 'lm-cast-bar';
+    bar.hidden = true;
+    bar.setAttribute('role', 'toolbar');
+    bar.setAttribute('aria-label', '按角色召回');
+    bar.addEventListener('click', onInputBarClick);
+    const bal = balanceBarIn(host);
+    if (bal) bal.after(bar);
+    else host.append(bar);
+    observeInputBar(host, bar);
+    return bar;
+}
+
+/** 宽度变化（窗口/侧栏/主题字号/余额条内容变化）与兄弟增删（余额插件后装）都要重排 */
+function observeInputBar(host, bar) {
+    if (typeof ResizeObserver === 'function' && !bar._lmResizeObserver) {
+        bar._lmResizeObserver = new ResizeObserver(() => scheduleInputBarLayout());
+        bar._lmResizeObserver.observe(bar);
+        const bal = balanceBarIn(host);
+        if (bal) bar._lmResizeObserver.observe(bal);   // 余额数字变长也会改变可用宽度
+    }
+    if (typeof MutationObserver === 'function' && !castBarObserver) {
+        castBarObserver = new MutationObserver(() => {
+            // 注意：只观察 childList，不观察 attributes —— 我们自己会改 #send_form 的 class，
+            // 观察属性会变成"重排 → 改 class → 又触发重排"的自激循环。
+            // mountInputBar 是幂等的：余额插件**后装**（或它自己被重新 mount）时，
+            // 这里会把我们这条重新插到它后面 —— 顺序不能靠"谁先挂"。
+            mountInputBar();
+            scheduleInputBarLayout();
+        });
+        castBarObserver.observe(host, { childList: true });
+    }
+}
+
+function scheduleInputBarLayout() {
+    if (castLayoutRaf) return;
+    const raf = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : (fn) => setTimeout(fn, 16);
+    castLayoutRaf = raf(() => { castLayoutRaf = 0; layoutInputBar(); });
+}
+
+/**
+ * 一条 bar 能放几个名字。
+ *
+ * 关键在"要不要留 +N 的位置"：先按可用宽度算一遍，全放得下就不需要 +N；
+ * 放不下时**先扣掉 +N 的宽度**再算 —— 否则 +N 一点出来就把最后一个名字挤出去。
+ *
+ * @param {number[]} widths 每个名字的真实像素宽（flex:0 0 auto，不会被压扁）
+ * @param {number} avail 可用宽度（不含 padding，也不含 +N）
+ * @param {number} gap chip 之间的间距
+ * @param {number} cap 用户设的上限
+ * @param {number} moreW 「+N」自身的宽度
+ */
+function fitChipCount(widths, avail, gap, cap, moreW) {
+    const n = widths.length;
+    if (!n || cap <= 0) return 0;
+    let used = 0, fit = 0;
+    for (let i = 0; i < n && fit < cap; i++) {
+        const add = widths[i] + (fit ? gap : 0);
+        if (used + add > avail) break;
+        used += add; fit++;
+    }
+    if (fit >= n && n <= cap) return n;          // 全放得下 → 不需要 +N
+    const budget = avail - moreW - gap;          // 留出 +N（以及它前面那个 gap）
+    used = 0; fit = 0;
+    for (let i = 0; i < n && fit < cap; i++) {
+        const add = widths[i] + (fit ? gap : 0);
+        if (used + add > budget) break;
+        used += add; fit++;
+    }
+    return fit;
+}
+
+/**
+ * 按实测宽度决定：共用一行还是独立一行、显示哪几个名字、+N 写几。
+ *
+ * 顺序很重要：**先定宽度体制再量可用宽度**。共用一行时我们这条是 `flex:1 1 0`（basis 0，
+ * 否则内容宽度会把自己顶到下一行），不共用时是 `width:100%`（否则余额条 width:100% 会把我们挤成 0 宽）。
+ */
+function layoutInputBar() {
+    const bar = document.getElementById(CAST_BAR_ID);
+    if (!bar || bar.hidden || !bar.parentElement) return null;
+    const host = bar.parentElement;
+    const strip = bar.querySelector('.lm-cast-strip');
+    const more = bar.querySelector('[data-lm-more]');
+    const chips = strip ? [...strip.querySelectorAll('.lm-chip')] : [];
+    if (!strip || !more || !chips.length) return null;
+
+    const prefs = getInputBarPrefs();
+    const gap = 4;
+
+    const measure = () => {
+        for (const c of chips) c.hidden = false;
+        more.hidden = true;
+        const avail = bar.clientWidth - 16;                     // 减掉左右 padding
+        const widths = chips.map(c => Math.ceil(c.getBoundingClientRect().width));
+        more.hidden = false;
+        more.textContent = `+${chips.length}`;                  // 最宽的情形（位数最多）
+        const moreW = Math.ceil(more.getBoundingClientRect().width) || 28;
+        more.hidden = true;
+        return { avail, widths, moreW };
+    };
+
+    const balance = isStackedForm(host) ? null : balanceBarIn(host);
+    host.classList.remove('lm-cast-shared');
+    let m = measure();
+    let slots = fitChipCount(m.widths, m.avail, gap, prefs.max, m.moreW);
+    if (balance) {
+        host.classList.add('lm-cast-shared');
+        const shared = measure();
+        const sharedSlots = fitChipCount(shared.widths, shared.avail, gap, prefs.max, shared.moreW);
+        if (sharedSlots >= MIN_SHARED_SLOTS) { m = shared; slots = sharedSlots; }
+        else host.classList.remove('lm-cast-shared');           // 挤不下就退回独立一行
+    }
+
+    const visible = Math.max(0, Math.min(slots, prefs.max, chips.length));
+    chips.forEach((c, i) => { c.hidden = i >= visible; });
+    const rest = chips.length - visible;
+    if (rest > 0) {
+        more.hidden = false;
+        more.textContent = `+${rest}`;
+        more.title = `还有 ${rest} 个名字（合计 ${chips.length} 个）—— 点开看全部，按"你最可能想召回的"排序`;
+    } else {
+        more.hidden = true;
+        more.textContent = '+0';
+        more.title = '';
+    }
+    return { shared: host.classList.contains('lm-cast-shared'), visible, total: chips.length, rest };
+}
+
+/**
+ * 重画召回条。
+ * @param {Array<object|string>|null} [override] 名字来源：数组 = 用这份；null = 清掉覆盖；省略 = 沿用上一次
+ * @returns {number} 渲染出来的名字个数（0 = 这条现在是隐藏的）
+ */
+function renderInputBar(override) {
+    if (Array.isArray(override)) castOverride = override;
+    else if (override === null) castOverride = null;
+
+    const prefs = getInputBarPrefs();
+    let bar = document.getElementById(CAST_BAR_ID);
+    if (!prefs.on) {
+        if (bar) { bar.hidden = true; bar.innerHTML = ''; }
+        castRows = [];
+        return 0;
+    }
+    if (!bar) bar = mountInputBar();
+    if (!bar) return 0;
+
+    if (Array.isArray(castOverride)) {
+        castRows = rankCast(castOverride.map(o => (typeof o === 'string' ? { name: o } : o)), {
+            pinnedUids, typed: inputBarTypedText(), recentText: recentChatText(), mru: recentCast,
+        });
+    } else {
+        let state = null;
+        try { state = getState(); } catch { state = null; }
+        if (!state || !state.bookName) {
+            bar.hidden = true;
+            bar.innerHTML = '';
+            castRows = [];
+            return 0;
+        }
+        castRows = rankCast(castIndex(state), {
+            pinnedUids, typed: inputBarTypedText(), recentText: recentChatText(), mru: recentCast,
+        });
+    }
+
+    if (!castRows.length) {
+        bar.hidden = true;
+        bar.innerHTML = '';
+        return 0;
+    }
+    bar.hidden = false;
+    bar.innerHTML = inputBarHtml(castRows);
+    layoutInputBar();
+    return castRows.length;
+}
+
+/** 这个名字现在是不是"整组都挂着"（与 rankCast / 面板 chip 的琥珀色同一个判据） */
+function castNameOn(name) {
+    let state = null;
+    try { state = getState(); } catch { return false; }
+    if (!state) return false;
+    const { injectable } = recallTargets(state, name);
+    return injectable.length > 0 && injectable.every(n => pinnedUids.has(n.uid));
+}
+
+async function onInputBarClick(ev) {
+    const more = ev.target.closest('[data-lm-more]');
+    if (more) { openCastPopup(); return; }
+    const chip = ev.target.closest('[data-lm-cast]');
+    if (!chip) return;
+    try {
+        await recallCast(chip.dataset.lmCast);
+    } catch (e) {
+        console.error('[LoreMemory] 输入框条召回失败', e);
+        toast(`召回失败：${e?.message || e}`, 'error');
+    }
+}
+
+/**
+ * 「+N」弹窗：全部名字（同一套排序）+ 过滤框，点一行就是召回/取消。
+ *
+ * 用 ST 标准 `callGenericPopup`（自带样式、Esc、遮罩点击关闭）而不是自己再写一个浮层：
+ * 内容只有一个列表，没必要重复造。
+ */
+function openCastPopup() {
+    if (!castRows.length) return;
+    const ctx = getCtx();
+    const holder = document.createElement('div');
+    holder.className = 'lm-cast-popup-holder';
+    holder.innerHTML = castPopupHtml(castRows);
+    const filter = holder.querySelector('[data-lm-cast-filter]');
+    const list = holder.querySelector('[data-lm-cast-list]');
+    if (filter && list) {
+        filter.addEventListener('input', () => {
+            const q = filter.value.trim().toLowerCase();
+            for (const row of list.children) {
+                row.hidden = !!q && !String(row.dataset.lmCast || '').toLowerCase().includes(q);
+            }
+        });
+        list.addEventListener('click', async (ev) => {
+            const row = ev.target.closest('[data-lm-cast]');
+            if (!row) return;
+            try {
+                await recallCast(row.dataset.lmCast);
+                // 弹窗里的这一行要跟着变（pin 状态是全局的，不能只让背后的 bar 亮）
+                const on = castNameOn(row.dataset.lmCast);
+                row.classList.toggle('lm-is-on', on);
+                row.dataset.lmOn = on ? '1' : '0';
+                const stateEl = row.querySelector('.lm-cast-row-state');
+                if (stateEl) stateEl.textContent = on ? '已召回 · 点一下取消' : '点一下召回';
+            } catch (e) {
+                console.error('[LoreMemory] 弹窗内召回失败', e);
+                toast(`召回失败：${e?.message || e}`, 'error');
+            }
+        });
+    }
+    try {
+        ctx.callGenericPopup(holder, ctx.POPUP_TYPE.TEXT, '', {
+            okButton: '关闭', wide: true, allowVerticalScrolling: true,
+        });
+    } catch (e) {
+        console.error('[LoreMemory] 打开角色召回弹窗失败', e);
+        toast('打开弹窗失败，可以在面板里用「按角色召回」', 'warning');
+    }
+}
+
+/** 输入框打字 → 重新排序（"正在输入"的名字会跳到第一个位置） */
+function bindSendTextarea() {
+    const ta = document.getElementById('send_textarea');
+    if (!ta || ta._lmTypingBound) return !!ta;
+    ta._lmTypingBound = true;
+    ta.addEventListener('input', () => {
+        if (castTypingTimer) clearTimeout(castTypingTimer);
+        castTypingTimer = setTimeout(() => { castTypingTimer = 0; renderInputBar(); }, TYPING_DEBOUNCE_MS);
+    });
+    return true;
+}
+
+/** 挂载 + 打字监听的重试（ST 的前端渲染可能比扩展执行慢，和 mountPanel 同一个理由） */
+function initInputBar() {
+    let tries = 0;
+    const tryMount = () => {
+        const bar = mountInputBar();
+        bindSendTextarea();
+        if (bar && document.getElementById('send_textarea')) return true;
+        return false;
+    };
+    if (tryMount()) { renderInputBar(); return; }
+    const timer = setInterval(() => {
+        if (tryMount() || ++tries > 40) {
+            clearInterval(timer);
+            renderInputBar();
+        }
+    }, 500);
+}
+
 // ───────────────────────── 面板挂载与事件 ─────────────────────────
 
 function toast(msg, type = 'info') {
@@ -1804,6 +2227,10 @@ function toast(msg, type = 'info') {
 }
 
 function render() {
+    // 输入框上方的召回条与面板是两个独立的挂点：面板不在（还没渲染出来）时这条也要跟着状态走，
+    // 所以它排在下面那个 early return **之前**。
+    try { renderInputBar(); } catch (e) { console.warn('[LoreMemory] 角色召回条重绘失败', e); }
+
     const root = document.getElementById(PANEL_ID);
     if (!root) return;
     const ctx = getCtx();
@@ -1836,6 +2263,8 @@ function render() {
         pinnedUids: new Set(pinnedUids),
         // 「记忆节点」分页（每页条数 / 当前页）
         pager: { ...getNodesPager(), sizes: PAGE_SIZES },
+        // 输入框上方那条召回条的偏好（开关 / 最多显示几个）—— 那个开关住在「生成设置」抽屉里
+        uiPrefs: { ...getInputBarPrefs(), inputBarMaxChoices: INPUT_BAR_MAX_CHOICES },
     });
     renderSettingsAdvice(state);
 }
@@ -1911,6 +2340,16 @@ async function onPanelSettingChange(ev) {
     const sizeEl = ev.target.closest('[data-lm-page-size]');
     if (sizeEl) {
         setNodesPager({ perPage: sizeEl.value });
+        render();
+        return;
+    }
+    // 输入框上方召回条的开关 / 最多显示几个（住在「生成设置」抽屉里，存在 ui 偏好里）
+    const uiEl = ev.target.closest('[data-lm-ui]');
+    if (uiEl) {
+        const key = uiEl.dataset.lmUi;
+        const value = uiEl.type === 'checkbox' ? uiEl.checked : uiEl.value;
+        if (key === 'inputBar') setInputBarPref({ on: value });
+        else if (key === 'inputBarMax') setInputBarPref({ max: value });
         render();
         return;
     }
@@ -2298,6 +2737,9 @@ async function init() {
     mountMenuButton();
     registerCommands();
 
+    // 输入框上方的「角色召回条」：挂点是 ST 自己渲染的 #send_form，可能比扩展慢，内部自带重试
+    initInputBar();
+
     // 「管理聊天书」弹窗：Esc 关闭（浮层挂在 body 上，点击遮罩和右上角关闭按钮也能关）
     document.addEventListener('keydown', (ev) => {
         if (ev.key === 'Escape' && booksModal.open) closeBooksModal();
@@ -2365,6 +2807,40 @@ window.LoreMemory = {
     // 「记忆节点」分页偏好（每页条数 / 当前页）
     get pager() { return { ...getNodesPager(), sizes: PAGE_SIZES }; },
     setNodesPager, getNodesPager,
+    // 输入框上方的「角色召回条」：挂点、排序依据、自适应收纳、+N 弹窗
+    inputBar: {
+        get root() { return document.getElementById(CAST_BAR_ID); },
+        /** 排好序的全量名字（含被收进 +N 的） */
+        get names() { return castRows.map(r => r.name); },
+        /** 当前真正露在条上的名字（顺序 = 从左到右） */
+        get visible() {
+            const bar = document.getElementById(CAST_BAR_ID);
+            if (!bar) return [];
+            return [...bar.querySelectorAll('.lm-cast-strip .lm-chip')].filter(c => !c.hidden).map(c => c.dataset.lmCast);
+        },
+        /** 被收进 +N 的名字 */
+        get hidden() {
+            const bar = document.getElementById(CAST_BAR_ID);
+            if (!bar) return [];
+            return [...bar.querySelectorAll('.lm-cast-strip .lm-chip')].filter(c => c.hidden).map(c => c.dataset.lmCast);
+        },
+        /** 「+N」的文案（不需要 +N 时是空串） */
+        get more() {
+            const bar = document.getElementById(CAST_BAR_ID);
+            const m = bar && bar.querySelector('[data-lm-more]');
+            return m && !m.hidden ? m.textContent : '';
+        },
+        /** 这条是不是正与余额条共用一行 */
+        get shared() {
+            const bar = document.getElementById(CAST_BAR_ID);
+            return !!(bar && bar.parentElement && bar.parentElement.classList.contains('lm-cast-shared'));
+        },
+        get recent() { return [...recentCast]; },
+        render: renderInputBar, layout: layoutInputBar, openPopup: openCastPopup, rankCast,
+        /** 「+N」弹窗的内容（纯函数；测试与预览页直接拿它渲染，不用真的开弹窗） */
+        popupHtml: castPopupHtml,
+    },
+    getInputBarPrefs, setInputBarPref,
     cleanupEmptyBooks, isRealChatContext,
     // 管理聊天书（两个版本都有）
     openBooksModal, closeBooksModal, refreshBooksModal, listPluginBooks,
