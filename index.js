@@ -652,7 +652,7 @@ async function summarizeWithGuard(prompt, opts = {}) {
         }
         const insp = inspectOutput(parseSummaryOutputForGuard(raw), raw, { words });
         cands.push({ raw, insp, attempt: i });
-        attempts.push({ attempt: i, shape: insp.shape, chars: insp.chars, keywords: insp.keywords, signals: insp.signals });
+        attempts.push({ attempt: i, shape: insp.shape, chars: insp.chars, bodyChars: insp.bodyChars, keywords: insp.keywords, overlong: insp.overlong, narrative: insp.narrative, trust: insp.trust, signals: insp.signals });
         if (!needsSummaryRepair(insp, prompt)) break;
         if (i >= MAX_SUMMARY_ATTEMPTS) break;
         if (now() - started > RETRY_BUDGET_MS) {
@@ -663,7 +663,8 @@ async function summarizeWithGuard(prompt, opts = {}) {
 
     const best = pickBetterSummary(cands) || { raw: '', insp: inspectOutput(null, '') };
     const retried = cands.length > 1;
-    const repaired = retried && best.insp.shape === 'json' && best.insp.ok === true;
+    // "修好了"= 最后一次拿到的正文真的可以原样进书（是 JSON、不超长、不像小说），见 guard.js 的 trust
+    const repaired = retried && best.insp.trust === true;
     if (retried) {
         console.log(`[LoreMemory] 摘要输出不合格，纠错重试 ${cands.length} 次：`, JSON.stringify(attempts));
     }
@@ -731,16 +732,21 @@ async function applyNodeOutput(raw, from, to, meta = {}) {
     // 关键词闸门：结构自检 + 判别力自检（对应 FR-14）
     const g = gateKeys(parsed.keywords, from + 1, to + 1);
     const degraded = parsed.degraded || !parsed.keywords.length;
+    // 守卫在"调模型那一层"给出的判词：这段正文可不可以原样进书（v3.1 新增）。
+    // 缺省（老调用 / 测试脚本直接驱动）按**不信任**处理 —— 反过来的默认值会让小说漏过去。
+    const guardFlagged = meta.trusted === false;
     // 关键词被剔光 = 这个节点永远不会被召回 → 交给人工确认（面板里的「改关键词」）
-    const review = degraded || !g.structuralOk || g.keys.length === 0;
+    const review = degraded || guardFlagged || !g.structuralOk || g.keys.length === 0;
 
-    // ★ 降级正文的长度闸门（v3）。实测事故：模型顺着 RP 文风续写，输出 4089 字 / 117 行的小说，
+    // ★ 正文长度闸门（v3 起，v3.1 扩容）。实测事故：模型顺着 RP 文风续写，输出 4089 字 / 117 行的小说，
     //   而这里**原样收下**当正文 —— 用户那本书 21 条里 7 条是这么来的。
     //   `nodeTokenCap` 此前是个死设置（只有面板标红读它），现在它真的能拦住这种正文。
     //   被切掉的原文进 `prevContent`（面板「回滚正文」可取回），所以是"默认不给"，不是"删掉"。
-    //   注意：**只对降级路径生效** —— 用户把「摘要目标长度」调大、模型也真的按 JSON 交了作业时，
-    //   不该由这条上限去砍他的正常正文。
-    const cap = degraded
+    //   v3.1 的教训：闸门**不能只认"没按 JSON 输出"** —— 模型完全可能交出格式正确的 JSON，
+    //   却把一整篇小说塞进 `summary` 字段（提示词越强调 JSON 越容易这样）。所以现在只要
+    //   守卫说这段正文不可信（`trusted === false`）就截断：不像归档的东西一律按降级处理。
+    const capNeeded = degraded || guardFlagged;
+    const cap = capNeeded
         ? capNodeBody(parsed.summary, { maxChars: charsForTokens(Number(settings.nodeTokenCap) || 200) })
         : { content: parsed.summary, truncated: false, chars: parsed.summary.length, kept: parsed.summary.length };
     const attempts = Number(meta.attempts) > 1 ? Number(meta.attempts) : 1;
@@ -777,9 +783,11 @@ async function applyNodeOutput(raw, from, to, meta = {}) {
     const why = !parsed.keywords.length
         ? `关键词为空（提示词可能没有按要求输出 JSON）${attempts > 1 ? `，已纠错重试 ${attempts} 次` : ''}`
         : (degraded ? `模型没有按 JSON 输出${attempts > 1 ? `（已纠错重试 ${attempts} 次仍不合格）` : ''}，已按纯文本处理并用兜底规则抽词${tail}`
-            : (g.dropped.length
-                ? `已剔除会误触发的关键词：${g.dropped.map(d => `${d.key}（${Math.round(d.allRatio * 100)}% 的消息里出现）`).join('、')}`
-                : (g.structuralWarn[0] || '')));
+            : (guardFlagged
+                ? `守卫判定这次正文不像归档（${parsed.summary.length} 字，不像"发生了什么/谁在场"那种结构），已按剧情处理${tail}`
+                : (g.dropped.length
+                    ? `已剔除会误触发的关键词：${g.dropped.map(d => `${d.key}（${Math.round(d.allRatio * 100)}% 的消息里出现）`).join('、')}`
+                    : (g.structuralWarn[0] || ''))));
 
     if (review) {
         toast(`节点 ${node.id} 已写入但标为「待确认」并暂时禁用：${why}。请在节点列表里点「改关键词」修好后启用。`, 'warning');
@@ -831,10 +839,12 @@ async function summarizePending({ manual = false } = {}) {
 
     let raw;
     let attempts = 1;
+    let trusted = false;
     try {
         const gen = await summarizeWithGuard(built.prompt);
         raw = gen.raw;
         attempts = gen.attempts.length || 1;
+        trusted = gen.insp?.trust === true;
         if (gen.retried) {
             const how = gen.repaired ? '纠错后已按格式返回' : '纠错后仍不合格，按降级处理';
             if (manual) toast(`模型没有按格式返回，已纠错重试 ${attempts} 次：${how}`, 'info');
@@ -845,7 +855,7 @@ async function summarizePending({ manual = false } = {}) {
         return { ok: false, reason: 'llm-error' };
     }
 
-    const applied = await applyNodeOutput(raw, from, to, { attempts });
+    const applied = await applyNodeOutput(raw, from, to, { attempts, trusted });
     if (!applied.ok) {
         toast('摘要返回空内容，本次放弃（游标未推进，可重试）', 'error');
         return applied;
@@ -968,6 +978,8 @@ async function resummarizeNode(state, node) {
 
     const g = gateKeys(parsed.keywords, node.from, node.to);
     const degraded = parsed.degraded || !parsed.keywords.length;
+    // 守卫的判词同样管这里（v3.1）：重摘要是一次有费用的手工动作，更不能把小说落进正文
+    const guardFlagged = gen.insp?.trust !== true;
 
     // 保留上一版正文，便于回溯（需求文档 FR-11「可撤销」）
     node.prevContent = node.content;
@@ -977,11 +989,12 @@ async function resummarizeNode(state, node) {
     node.droppedKeys = g.dropped.map(d => d.key);
     // 同样不许把一篇小说写进正文；但这次 `prevContent` 已经被"上一版正文"占用（FR-11），
     // 所以这里截断后**不保留**被切掉的原文，只在提示里说清楚（手动重摘要，用户看得见）。
-    const recap = degraded
+    const capNeeded = degraded || guardFlagged;
+    const recap = capNeeded
         ? capNodeBody(parsed.summary, { maxChars: charsForTokens(Number(settings.nodeTokenCap) || 200), note: false })
         : { content: parsed.summary, truncated: false, chars: parsed.summary.length, kept: parsed.summary.length };
     node.content = recap.content;
-    node.status = (degraded || !g.structuralOk || g.keys.length === 0) ? 'needs_review' : 'active';
+    node.status = (capNeeded || !g.structuralOk || g.keys.length === 0) ? 'needs_review' : 'active';
     node.source = 'llm';
 
     await writeNode(state, node);
