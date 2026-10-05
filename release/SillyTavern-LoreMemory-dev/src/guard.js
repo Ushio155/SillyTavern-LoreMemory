@@ -1,6 +1,10 @@
 /**
  * 纯函数：生成结果的「硬闸门」—— 不依赖模型配合的确定性兜底
  *
+ * 两层守卫，同一原则（提示词只能"请求"模型守规矩，守卫才"保证"）：
+ *   ① 骨架现状卡 `enforceSkeleton()` —— 结构过滤 + 超长裁剪 + 完全不合法就拒收
+ *   ② 节点摘要 `inspectOutput()` / `needsSummaryRepair()` / `pickBetterSummary()` / `capNodeBody()`
+ *
  * 为什么需要它（实测证据，41 楼真实聊天 + deepseek-flash）：
  *   骨架提示词要求「正文总长不超过 {{words}}=200 字」，模型实际输出 **665 字（3.3 倍）**，
  *   并把一张状态表写成了小说（场景描写 / 对白 / 心理独白，17 段里 0 段来自聊天记录）。
@@ -9,10 +13,11 @@
  *     · 设置项 `skeletonTokenCap` 在全仓库**没有任何代码读它**（死设置，探针实测 0 处）。
  *   于是坏输出原样进入世界书，并在下一轮作为 `{{previous}}` 再喂回给模型 —— 错误自我叠加。
  *
- * 提示词只能"请求"模型守规矩，不能"保证"。所以这里做两件确定性的事：
- *   ① 结构化过滤：只保留状态字段行，丢弃叙述体（丢掉的内容不进上下文 = 真正省 token）
- *   ② 硬长度上限：超过 tokenCap 时按字段优先级裁剪，**绝不原样放行**
- * 结构完全不合法时明确返回 ok:false，由调用方保留旧卡 —— 宁可留着上一版，也不写入垃圾。
+ * 节点的第二份实测证据（v3 补的，就在用户的真实聊天书上量的）：
+ *   21 条条目里有 **7 条**正文是 1.5k–4.1k 字的小说体、关键词是 2–6 字碎片，
+ *   全部被标「待确认」禁用 —— 而节点侧当时**只有"降级"没有"拒绝"**：
+ *   `parseSummaryOutput` 找不到 JSON 就把整篇小说当正文收下，一次坏采样直接进书。
+ *   对照 CardLore §8.3「输出守卫与自动修复」：客户端必须能断定"这次输出不合格"并重试。
  *
  * 本文件不 import 任何模块（估 token 由调用方注入），可在 Node 里直接跑回归。
  */
@@ -241,4 +246,166 @@ export function enforceSkeleton(raw, opts = {}) {
         changed: actions.length > 0,
         overCapRemain: tokens > cap,
     };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 节点输出守卫（v3）
+//
+// 与骨架守卫的分工：骨架是"结构对不对"（字段行），节点是"作业交没交"（是不是那个 JSON）。
+// 节点守卫**不重做 JSON 解析** —— 解析由 src/settings.js 的 `parseSummaryOutput` 负责，
+// 这里只拿它的结果 + 原文来做三件事，避免两处各写一份解析逻辑而慢慢漂移：
+//   ① 判定形状（json / text / narrative / empty）② 决定要不要带着"格式纠错"重试 ③ 多次取优
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/** 默认节点提示词要求的小节标题（出现得多 ⇒ 更像"归档"，而不是"在写小说"） */
+export const SUMMARY_SECTIONS = ['发生了什么', '谁在场', '状态变化', '未结钩子', '关键设定'];
+
+/** 单次总结最多尝试几次（第一次 + 最多两次纠错重试）。费用只在**不合格**时才产生。 */
+export const MAX_SUMMARY_ATTEMPTS = 3;
+
+/**
+ * 一轮总结（含纠错重试）的总时间预算。
+ * 超过就不再重试：index.js 的 `SUMMARIZING_STALE_MS`（150 秒）会把"正在生成"判成卡死，
+ * 3 次慢生成足以撞上它，那会表现成"面板忽然说没在生成、自动总结又能重入"的诡异现象。
+ */
+export const RETRY_BUDGET_MS = 120000;
+
+/**
+ * 格式纠错后缀：拼在**原提示词之后**再发一次。
+ *
+ * 为什么不改写系统提示：ST 把 quiet 提示词放在整段上下文的最后一条消息
+ * （`scripts/openai.js` L1211-1227「This should always be last」），
+ * 所以"最后那句话"权重最高 —— 纠错必须落在这个位置上，而不是塞进已经被淹没的开头。
+ */
+export const REPAIR_JSON_SUFFIX = `【格式纠错】你上一次的回复不是要求的 JSON 对象，而是一段叙述 / 剧情文字。
+那整段是**待归档的材料**，不是要你写的东西 —— 不要复述它、不要续写它、不要写对白。
+现在只输出那一个 JSON 对象：第一个字符必须是 { ，且只包含 title / tier / keywords / summary 四个字段。`;
+
+/** 空输出后缀（推理模型把预算烧在思维链上时的现场对策，对照 CardLore 的 EMPTY_OUTPUT_SUFFIX） */
+export const EMPTY_OUTPUT_SUFFIX = `【立即动笔】不要分析任务、不要输出思考过程、不要解释。
+直接从 { 开始，把那一个 JSON 对象写出来。`;
+
+/**
+ * 提示词自己声明了要 JSON 吗？
+ *
+ * 用来区分两种"没给 JSON"：违约（我们要求的）还是本意（用户自己改的提示词）。
+ * 拿提示词**模板**判断，不看模型输出 —— 这样"用户故意让提示词输出纯文本"不会被我们硬拗成 JSON。
+ *
+ * 难点全在中文否定上（写这条时踩了个真坑）：`/json/i` 会把「**不要** JSON」也判成"要 JSON"，
+ * 于是"尊重用户意图"那条策略直接失效。所以先认否定、再认正向：
+ *   · 正向优先：「只输出 JSON」「必须输出 JSON」这类强要求，直接算要 JSON；
+ *   · 否定：「不要 / 无需 / 不用 / 别 / 禁止（输出）JSON」⇒ 不要 —— 但「不要输出 JSON **以外的**内容」
+ *     显然是要 JSON，所以否定后面跟着"以外/之外"时不算否定。
+ * 判错的代价是**不对称**的：漏判只会少重试一次（坏输出照样降级+截断，不会更糟），
+ * 误判才会去跟用户的提示词对着干。所以这里的取向是"宁可漏判"。
+ */
+export function promptWantsJson(template) {
+    const t = String(template ?? '');
+    if (!t) return false;
+    if (/(只|仅|必须|一定|请)\s*(输出\s*)?(那?一?个?\s*)?json/i.test(t)) return true;
+    if (/(不要|无需|不用|别|禁止)\s*(输出\s*)?json(?!\s*(以外|之外))/i.test(t)) return false;
+    return /json/i.test(t) || /\{\s*"/.test(t);
+}
+
+/**
+ * 判定一次生成结果的形状。**廉价且不可欺骗**（只做字面统计，不做语义判断）。
+ *
+ * @param {{ok:boolean, degraded:boolean, format:string, keywords?:string[]}} parsed
+ *        `parseSummaryOutput` 的结果（JSON 解析的唯一来源）
+ * @param {string} raw 模型原始输出
+ * @param {{words?:number}} [opts] words = 目标字数，用来判"远远超长"
+ * @returns {{shape:'json'|'text'|'narrative'|'empty', ok:boolean, chars:number,
+ *            lines:number, sections:number, keywords:number, signals:string[]}}
+ */
+export function inspectOutput(parsed, raw, opts = {}) {
+    const text = stripFence(raw);
+    const words = Number(opts.words) > 0 ? Number(opts.words) : 200;
+    const lines = text.split(/\r?\n/).map(s => s.trim()).filter(Boolean).length;
+    const sections = SUMMARY_SECTIONS.filter(s => text.includes(s)).length;
+    const keywords = Array.isArray(parsed?.keywords) ? parsed.keywords.length : 0;
+    const base = { ok: parsed?.ok === true, chars: text.length, lines, sections, keywords, signals: [] };
+
+    if (!text.length) return { ...base, shape: 'empty', signals: ['空输出'] };
+    // parseSummaryOutput 只在**真的解析出了 JSON 对象**时才 degraded=false
+    if (parsed && parsed.degraded === false) return { ...base, shape: 'json' };
+
+    const signals = [];
+    const dialogue = (text.match(/「[^」]{2,}」/g) || []).length;
+    if (dialogue >= 2) signals.push(`成句对白 ${dialogue} 处`);
+    const inner = (text.match(/【[^】]{6,}】/g) || []).length;
+    if (inner >= 1) signals.push(`方括号独白/板块 ${inner} 处`);
+    const blanks = (text.match(/\n[ \t]*\n/g) || []).length;
+    if (blanks >= 3 || lines >= 12) signals.push(`多段叙述（${lines} 段 / ${blanks} 处空行）`);
+    if (sections === 0) signals.push('一个规定小节标题都没有');
+    if (text.length > Math.max(2 * words, 400)) signals.push(`${text.length} 字远超目标 ${words} 字`);
+
+    // 至少两条独立特征、且没有我们的结构化小节 ⇒ 判"在写小说"（单条特征太容易误伤正常摘要）
+    const narrative = signals.length >= 2 && sections <= 1;
+    return { ...base, shape: narrative ? 'narrative' : 'text', signals };
+}
+
+/** 这次输出要不要带着纠错后缀重试？（策略见 REPAIR_JSON_SUFFIX / promptWantsJson 的注释） */
+export function needsSummaryRepair(insp, template) {
+    if (!insp) return false;
+    if (insp.shape === 'empty') return true;               // 空输出：多半是推理把预算烧光了
+    if (insp.shape === 'json') return insp.ok === false;   // 是 JSON 但没有可用正文
+    if (insp.shape === 'narrative') return true;           // 写小说：无论提示词怎么写都算坏
+    return promptWantsJson(template);                      // 纯文本：只有"提示词自己要过 JSON"才算违约
+}
+
+const SHAPE_RANK = { json: 2, text: 1, narrative: 0, empty: -1 };
+
+/**
+ * 多次尝试里取优（对照 CardLore 的 `pickBetterOutput`：先比字段命中数，再比保留率）。
+ * 我们比的东西必须**廉价**：形状 → 关键词个数 → 更短（小说越长越是灾难）。
+ * 完全同分取**后者**（它带着纠错后缀重来过，更可能是"想对了但没说完"）。
+ *
+ * @param {Array<{raw:string, insp:object}>} cands
+ * @returns {{raw:string, insp:object}|null}
+ */
+export function pickBetterSummary(cands) {
+    const list = Array.isArray(cands) ? cands.filter(Boolean) : [];
+    let best = null;
+    for (const c of list) {
+        if (!best) { best = c; continue; }
+        const ra = SHAPE_RANK[c.insp?.shape] ?? -1;
+        const rb = SHAPE_RANK[best.insp?.shape] ?? -1;
+        if (ra !== rb) { if (ra > rb) best = c; continue; }
+        const ka = Number(c.insp?.keywords) || 0;
+        const kb = Number(best.insp?.keywords) || 0;
+        if (ka !== kb) { if (ka > kb) best = c; continue; }
+        const ca = Number(c.insp?.chars) || 0;
+        const cb = Number(best.insp?.chars) || 0;
+        if (ca < cb) best = c;
+        else if (ca === cb) best = c;   // 同分取后者
+    }
+    return best;
+}
+
+/**
+ * 降级正文的长度闸门：模型没按格式返回时，**绝不把一整篇小说原样写进书里**
+ * （世界书条目是要被注入上下文的；节点此时虽然标了「待确认」并禁用，
+ *  但用户随时可能点"启用"，而且 4 KB 的正文在面板里也读不出任何信息）。
+ *
+ * 截断点尽量落在句读 / 换行上；被切掉的原文由调用方存进 `prevContent`，
+ * 面板上的「回滚正文」能取回 —— 所以这是"默认不给"，不是"删掉"。
+ *
+ * @param {string} text
+ * @param {{maxChars:number, note?:boolean}} opts
+ * @returns {{content:string, truncated:boolean, chars:number, kept:number}}
+ */
+export function capNodeBody(text, opts = {}) {
+    const src = String(text ?? '');
+    const maxChars = Number(opts.maxChars) > 0 ? Math.floor(Number(opts.maxChars)) : 0;
+    if (!maxChars || src.length <= maxChars) {
+        return { content: src, truncated: false, chars: src.length, kept: src.length };
+    }
+    let head = src.slice(0, maxChars);
+    const cut = Math.max(...['。', '！', '？', '；', '\n'].map(c => head.lastIndexOf(c)));
+    if (cut >= Math.floor(maxChars * 0.5)) head = head.slice(0, cut + 1);
+    head = head.trimEnd();
+    const note = opts.note === false
+        ? ''
+        : `\n\n（模型没有按 JSON 格式返回，原文 ${src.length} 字：以上是前 ${head.length} 字，未采纳；点「回滚正文」可取回完整原文）`;
+    return { content: head + note, truncated: true, chars: src.length, kept: head.length };
 }

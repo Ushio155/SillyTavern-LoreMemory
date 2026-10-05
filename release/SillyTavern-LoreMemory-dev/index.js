@@ -50,8 +50,19 @@ import { SlashCommand } from '../../../slash-commands/SlashCommand.js';
 import { ARGUMENT_TYPE, SlashCommandArgument } from '../../../slash-commands/SlashCommandArgument.js';
 import { oai_settings } from '../../../../scripts/openai.js';
 
-import { estimateTokens } from './src/tokens.js';
-import { enforceSkeleton, SKELETON_FIELDS } from './src/guard.js';
+import { estimateTokens, charsForTokens } from './src/tokens.js';
+import {
+    enforceSkeleton,
+    SKELETON_FIELDS,
+    MAX_SUMMARY_ATTEMPTS,
+    RETRY_BUDGET_MS,
+    REPAIR_JSON_SUFFIX,
+    EMPTY_OUTPUT_SUFFIX,
+    inspectOutput,
+    needsSummaryRepair,
+    pickBetterSummary,
+    capNodeBody,
+} from './src/guard.js';
 import {
     STATE_KEY,
     normalizeState,
@@ -590,6 +601,76 @@ async function callLlm(prompt) {
 }
 
 /**
+ * 解析一次模型输出（带主角名/用户名排除）—— 守卫与落库**必须用同一份解析**，
+ * 否则可能出现"守卫说合格、落库却走了降级"这种自相矛盾的状态。
+ */
+function parseSummaryOutputForGuard(raw) {
+    const ctx = getCtx();
+    return parseSummaryOutput(raw, { exclude: [ctx.name1, ctx.name2].filter(Boolean) });
+}
+
+/**
+ * 「调模型 + 输出守卫 + 格式纠错重试」——节点摘要的唯一入口。
+ *
+ * 为什么必须有这一层（真实事故，在用户的聊天书上量的）：21 条条目里有 7 条正文是
+ * 1.5k–4.1k 字的小说体、关键词是 2–6 字碎片（全部标「待确认」禁用）。节点侧当时
+ * 只有"降级"没有"拒绝" —— 模型一旦顺着 RP 文风写下去，一次坏采样就直接进书。
+ * 对照 CardLore §8.3「输出守卫与自动修复」：客户端必须能断定"这次输出不合格"并重试，
+ * 而不是只把要求写进提示词里祈祷。
+ *
+ * 三个刻意的取舍：
+ *  · **异常不重试**（API 报错 / 超时 / 上下文超限）：那是另一类问题，重试只会把
+ *    "正在生成"拖成卡死假象、白烧 token，所以只有"内容不合格"才重试；
+ *  · 重试时把纠错后缀拼在**原提示词之后**（不是改写开头）：ST 把 quiet 提示词放在
+ *    整段上下文最后一条消息（`scripts/openai.js` L1211-1227），最后那句话权重最高；
+ *  · 整轮还有总时间预算 `RETRY_BUDGET_MS`，超了就不再试 —— 别让重试把
+ *    `SUMMARIZING_STALE_MS` 的卡死判定撞成假象。
+ *
+ * @param {string} prompt 已经渲染好的提示词
+ * @param {{call?:Function, words?:number, now?:Function}} [opts] call 可注入（测试用脚本化模型）
+ * @returns {Promise<{raw:string, insp:object, attempts:Array<object>, retried:boolean, repaired:boolean}>}
+ */
+async function summarizeWithGuard(prompt, opts = {}) {
+    const call = typeof opts.call === 'function' ? opts.call : callLlm;
+    const now = typeof opts.now === 'function' ? opts.now : Date.now;
+    const words = Number(opts.words) > 0 ? Number(opts.words) : (Number(getSettings().promptWords) || 0);
+    const started = now();
+    const cands = [];
+    const attempts = [];
+
+    for (let i = 1; i <= MAX_SUMMARY_ATTEMPTS; i++) {
+        const prevShape = cands.length ? cands[cands.length - 1].insp.shape : '';
+        const text = i === 1
+            ? prompt
+            : `${prompt}\n\n${prevShape === 'empty' ? EMPTY_OUTPUT_SUFFIX : REPAIR_JSON_SUFFIX}`;
+        let raw;
+        try {
+            raw = await call(text);
+        } catch (e) {
+            if (i === 1) throw e;      // 第一次就失败：与原逻辑一致，交给调用方报错
+            break;                     // 重试那次失败：保留已有结果，不再纠缠
+        }
+        const insp = inspectOutput(parseSummaryOutputForGuard(raw), raw, { words });
+        cands.push({ raw, insp, attempt: i });
+        attempts.push({ attempt: i, shape: insp.shape, chars: insp.chars, keywords: insp.keywords, signals: insp.signals });
+        if (!needsSummaryRepair(insp, prompt)) break;
+        if (i >= MAX_SUMMARY_ATTEMPTS) break;
+        if (now() - started > RETRY_BUDGET_MS) {
+            console.log('[LoreMemory] 重试时间预算已用完，停止纠错重试');
+            break;
+        }
+    }
+
+    const best = pickBetterSummary(cands) || { raw: '', insp: inspectOutput(null, '') };
+    const retried = cands.length > 1;
+    const repaired = retried && best.insp.shape === 'json' && best.insp.ok === true;
+    if (retried) {
+        console.log(`[LoreMemory] 摘要输出不合格，纠错重试 ${cands.length} 次：`, JSON.stringify(attempts));
+    }
+    return { raw: best.raw, insp: best.insp, attempts, retried, repaired };
+}
+
+/**
  * 组装「总结未总结的那一段」要发给模型的提示词。
  *
  * 刻意把"拼提示词"和"调模型"拆开：
@@ -639,9 +720,11 @@ function gateKeys(rawKeys, from, to) {
  * @param {string} raw 模型原始输出
  * @param {number} from 0 基起始下标（含）
  * @param {number} to 0 基结束下标（含）
+ * @param {{attempts?:number}} [meta] attempts = 这次落库前一共调了几次模型（守卫重试用，只影响提示文案）
  */
-async function applyNodeOutput(raw, from, to) {
+async function applyNodeOutput(raw, from, to, meta = {}) {
     const ctx = getCtx();
+    const settings = getSettings();
     const parsed = parseSummaryOutput(raw, { exclude: [ctx.name1, ctx.name2].filter(Boolean) });
     if (!parsed.ok) return { ok: false, reason: 'empty-output' };
 
@@ -650,6 +733,17 @@ async function applyNodeOutput(raw, from, to) {
     const degraded = parsed.degraded || !parsed.keywords.length;
     // 关键词被剔光 = 这个节点永远不会被召回 → 交给人工确认（面板里的「改关键词」）
     const review = degraded || !g.structuralOk || g.keys.length === 0;
+
+    // ★ 降级正文的长度闸门（v3）。实测事故：模型顺着 RP 文风续写，输出 4089 字 / 117 行的小说，
+    //   而这里**原样收下**当正文 —— 用户那本书 21 条里 7 条是这么来的。
+    //   `nodeTokenCap` 此前是个死设置（只有面板标红读它），现在它真的能拦住这种正文。
+    //   被切掉的原文进 `prevContent`（面板「回滚正文」可取回），所以是"默认不给"，不是"删掉"。
+    //   注意：**只对降级路径生效** —— 用户把「摘要目标长度」调大、模型也真的按 JSON 交了作业时，
+    //   不该由这条上限去砍他的正常正文。
+    const cap = degraded
+        ? capNodeBody(parsed.summary, { maxChars: charsForTokens(Number(settings.nodeTokenCap) || 200) })
+        : { content: parsed.summary, truncated: false, chars: parsed.summary.length, kept: parsed.summary.length };
+    const attempts = Number(meta.attempts) > 1 ? Number(meta.attempts) : 1;
 
     const state = getState();
     const node = {
@@ -660,7 +754,8 @@ async function applyNodeOutput(raw, from, to) {
         title: parsed.title,
         keys: g.keys,
         droppedKeys: g.dropped.map(d => d.key),
-        content: parsed.summary,
+        content: cap.content,
+        prevContent: cap.truncated ? parsed.summary : '',
         tokens: 0,
         // tier 决定 order 阶梯（main 500 / side 300 / detail 100）。以前这里硬编码 'side'，
         // 于是 FR-15 的"分层召回"对节点从未生效 —— 所有节点同权，预算紧张时谁被挤掉是随机的。
@@ -678,9 +773,10 @@ async function applyNodeOutput(raw, from, to) {
     persist();
     render();
 
+    const tail = cap.truncated ? `，正文已截到 ${cap.kept} 字（原文 ${cap.chars} 字，可「回滚正文」取回）` : '';
     const why = !parsed.keywords.length
-        ? '关键词为空（提示词可能没有按要求输出 JSON）'
-        : (degraded ? '模型没有按 JSON 输出，已按纯文本处理并用兜底规则抽词'
+        ? `关键词为空（提示词可能没有按要求输出 JSON）${attempts > 1 ? `，已纠错重试 ${attempts} 次` : ''}`
+        : (degraded ? `模型没有按 JSON 输出${attempts > 1 ? `（已纠错重试 ${attempts} 次仍不合格）` : ''}，已按纯文本处理并用兜底规则抽词${tail}`
             : (g.dropped.length
                 ? `已剔除会误触发的关键词：${g.dropped.map(d => `${d.key}（${Math.round(d.allRatio * 100)}% 的消息里出现）`).join('、')}`
                 : (g.structuralWarn[0] || '')));
@@ -692,7 +788,7 @@ async function applyNodeOutput(raw, from, to) {
     } else {
         toast(`已生成节点 ${node.id}：${node.title}（${node.from}-${node.to}楼）`, 'success');
     }
-    return { ok: true, node, review, why, dropped: g.dropped, format: parsed.format };
+    return { ok: true, node, review, why, dropped: g.dropped, format: parsed.format, capped: cap.truncated, attempts };
 }
 
 /**
@@ -734,15 +830,22 @@ async function summarizePending({ manual = false } = {}) {
     }
 
     let raw;
+    let attempts = 1;
     try {
-        raw = await callLlm(built.prompt);
+        const gen = await summarizeWithGuard(built.prompt);
+        raw = gen.raw;
+        attempts = gen.attempts.length || 1;
+        if (gen.retried) {
+            const how = gen.repaired ? '纠错后已按格式返回' : '纠错后仍不合格，按降级处理';
+            if (manual) toast(`模型没有按格式返回，已纠错重试 ${attempts} 次：${how}`, 'info');
+        }
     } catch (e) {
         console.error('[LoreMemory] 摘要失败', e);
         toast(`摘要失败：${e?.message || e}（原历史未丢失，游标未推进，可重试）`, 'error');
         return { ok: false, reason: 'llm-error' };
     }
 
-    const applied = await applyNodeOutput(raw, from, to);
+    const applied = await applyNodeOutput(raw, from, to, { attempts });
     if (!applied.ok) {
         toast('摘要返回空内容，本次放弃（游标未推进，可重试）', 'error');
         return applied;
@@ -855,8 +958,9 @@ async function resummarizeNode(state, node) {
     }
 
     const prompt = renderPrompt(settings.prompt, promptVars(text, used, from, to));
-    let raw;
-    try { raw = await callLlm(prompt); } catch (e) { toast(`重摘要失败：${e?.message || e}`, 'error'); return; }
+    let gen;
+    try { gen = await summarizeWithGuard(prompt); } catch (e) { toast(`重摘要失败：${e?.message || e}`, 'error'); return; }
+    const raw = gen.raw;
 
     const ctx = getCtx();
     const parsed = parseSummaryOutput(raw, { exclude: [ctx.name1, ctx.name2].filter(Boolean) });
@@ -871,7 +975,12 @@ async function resummarizeNode(state, node) {
     node.tier = parsed.tier;
     node.keys = g.keys;
     node.droppedKeys = g.dropped.map(d => d.key);
-    node.content = parsed.summary;
+    // 同样不许把一篇小说写进正文；但这次 `prevContent` 已经被"上一版正文"占用（FR-11），
+    // 所以这里截断后**不保留**被切掉的原文，只在提示里说清楚（手动重摘要，用户看得见）。
+    const recap = degraded
+        ? capNodeBody(parsed.summary, { maxChars: charsForTokens(Number(settings.nodeTokenCap) || 200), note: false })
+        : { content: parsed.summary, truncated: false, chars: parsed.summary.length, kept: parsed.summary.length };
+    node.content = recap.content;
     node.status = (degraded || !g.structuralOk || g.keys.length === 0) ? 'needs_review' : 'active';
     node.source = 'llm';
 
@@ -880,7 +989,10 @@ async function resummarizeNode(state, node) {
     persist();
     render();
     const extra = g.dropped.length ? `；已剔除误触发关键词 ${g.dropped.map(d => d.key).join('、')}` : '';
-    toast(`已重新总结 ${node.id}（uid 未变，粘滞/冷却状态保留）${extra}`, g.dropped.length ? 'info' : 'success');
+    const cut = recap.truncated ? `；正文已截到 ${recap.kept} 字（原文 ${recap.chars} 字未保留）` : '';
+    const retryNote = gen.retried ? `（纠错重试 ${gen.attempts.length} 次${gen.repaired ? '后已按格式返回' : '仍不合格'}）` : '';
+    toast(`已重新总结 ${node.id}${retryNote}（uid 未变，粘滞/冷却状态保留）${extra}${cut}`,
+        (g.dropped.length || recap.truncated || gen.retried) ? 'info' : 'success');
 }
 
 /**
@@ -2850,6 +2962,9 @@ window.LoreMemory = {
     get booksModal() { return { ...booksModal }; },
     // 流水线分段：可以在不调模型的前提下验证"拼提示词"与"落库"两段
     buildNodePrompt, applyNodeOutput, pendingRange,
+    // 节点输出守卫：`summarizeWithGuard` 接受注入的 call（脚本化模型），
+    // 所以"模型第一次写小说、纠错后按格式返回"这条链路可以在不联网的前提下端到端验证
+    summarizeWithGuard, inspectOutput, capNodeBody,
     // 上下文预算：driver 用它断言"读入的记录真的被预算夹住了"
     maxPromptTokenBudget, transcriptBudgetTokens,
     render, scheduleAutoWork,

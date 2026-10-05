@@ -37,6 +37,21 @@ export function estimateTokens(text) {
 }
 
 /**
+ * token 上限 → 大约多少**汉字**够用。
+ *
+ * 用途：把「单条节点上限（token）」翻译成一个可以直接切字符串的字数上限，
+ * 这样守卫不必依赖 estimateTokens 反复回算（切一次就知道够不够）。
+ * 取的是保守侧（1.2 字/token），所以切出来的正文估算后**不会**超过上限。
+ *
+ * @param {number} tokens
+ * @returns {number} 汉字数上限（至少 1）
+ */
+export function charsForTokens(tokens) {
+    const v = Number(tokens) > 0 ? Number(tokens) : 0;
+    return Math.max(1, Math.floor(v * CJK_CHARS_PER_TOKEN));
+}
+
+/**
  * 把 token 数渲染成人读形式。
  * @param {number} n
  * @returns {string}
