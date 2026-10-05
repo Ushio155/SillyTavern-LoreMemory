@@ -307,57 +307,96 @@ export function promptWantsJson(template) {
     return /json/i.test(t) || /\{\s*"/.test(t);
 }
 
+/** 正文"远远超长"的阈值：目标字数的 2 倍，下限 400 字 */
+export function overlongLimit(words) {
+    const w = Number(words) > 0 ? Number(words) : 200;
+    return Math.max(2 * w, 400);
+}
+
 /**
  * 判定一次生成结果的形状。**廉价且不可欺骗**（只做字面统计，不做语义判断）。
  *
- * @param {{ok:boolean, degraded:boolean, format:string, keywords?:string[]}} parsed
+ * ⚠️ v3.1 修的洞（用户实测"写完 JSON 还是写小说"）：判据必须看**将要落库的那段正文**
+ * （`parsed.summary`），而不是只看"整段输出是不是 JSON"。原来的写法是
+ * `degraded === false ⇒ 立刻 return shape:'json'`，于是当模型**老老实实交了 JSON、
+ * 却把一整篇小说塞进 `summary` 字段**时：既不算 narrative（根本没跑那些特征检测）、
+ * 也不算超长（没有长度判据），守卫直接放行，`nodeTokenCap` 也只管降级路径 ——
+ * 结果就是"格式完全正确的小说"原样进书，而且因为关键词解析成功还标成 active。
+ * 这是 v3 提示词的**副作用**：提示词越强调"只输出 JSON"，模型越可能用 JSON 包装续写。
+ *
+ * @param {{ok:boolean, degraded:boolean, format:string, keywords?:string[], summary?:string}} parsed
  *        `parseSummaryOutput` 的结果（JSON 解析的唯一来源）
  * @param {string} raw 模型原始输出
  * @param {{words?:number}} [opts] words = 目标字数，用来判"远远超长"
- * @returns {{shape:'json'|'text'|'narrative'|'empty', ok:boolean, chars:number,
- *            lines:number, sections:number, keywords:number, signals:string[]}}
+ * @returns {{shape:'json'|'text'|'narrative'|'empty', ok:boolean, trust:boolean, chars:number,
+ *            bodyChars:number, overlong:boolean, narrative:boolean, lines:number, sections:number,
+ *            keywords:number, signals:string[]}}
  */
 export function inspectOutput(parsed, raw, opts = {}) {
     const text = stripFence(raw);
     const words = Number(opts.words) > 0 ? Number(opts.words) : 200;
-    const lines = text.split(/\r?\n/).map(s => s.trim()).filter(Boolean).length;
-    const sections = SUMMARY_SECTIONS.filter(s => text.includes(s)).length;
-    const keywords = Array.isArray(parsed?.keywords) ? parsed.keywords.length : 0;
-    const base = { ok: parsed?.ok === true, chars: text.length, lines, sections, keywords, signals: [] };
-
-    if (!text.length) return { ...base, shape: 'empty', signals: ['空输出'] };
     // parseSummaryOutput 只在**真的解析出了 JSON 对象**时才 degraded=false
-    if (parsed && parsed.degraded === false) return { ...base, shape: 'json' };
+    const shaped = !!parsed && parsed.degraded === false;
+    const body = String(parsed?.summary ?? '').trim();
+    // 判据看"要落库的正文"；连正文都没有（空输出）时才退回看整段原文
+    const subject = shaped && body ? body : text;
+    const lines = subject.split(/\r?\n/).map(s => s.trim()).filter(Boolean).length;
+    const sections = SUMMARY_SECTIONS.filter(s => subject.includes(s)).length;
+    const keywords = Array.isArray(parsed?.keywords) ? parsed.keywords.length : 0;
+    const bodyChars = body.length || text.length;
+    const overlong = bodyChars > overlongLimit(words);
 
     const signals = [];
-    const dialogue = (text.match(/「[^」]{2,}」/g) || []).length;
+    if (overlong) signals.push(`${bodyChars} 字远超目标 ${words} 字`);
+    const dialogue = (subject.match(/「[^」]{2,}」/g) || []).length;
     if (dialogue >= 2) signals.push(`成句对白 ${dialogue} 处`);
-    const inner = (text.match(/【[^】]{6,}】/g) || []).length;
+    const inner = (subject.match(/【[^】]{6,}】/g) || []).length;
     if (inner >= 1) signals.push(`方括号独白/板块 ${inner} 处`);
-    const blanks = (text.match(/\n[ \t]*\n/g) || []).length;
+    const blanks = (subject.match(/\n[ \t]*\n/g) || []).length;
     if (blanks >= 3 || lines >= 12) signals.push(`多段叙述（${lines} 段 / ${blanks} 处空行）`);
     if (sections === 0) signals.push('一个规定小节标题都没有');
-    if (text.length > Math.max(2 * words, 400)) signals.push(`${text.length} 字远超目标 ${words} 字`);
 
     // 至少两条独立特征、且没有我们的结构化小节 ⇒ 判"在写小说"（单条特征太容易误伤正常摘要）
     const narrative = signals.length >= 2 && sections <= 1;
-    return { ...base, shape: narrative ? 'narrative' : 'text', signals };
+    const ok = parsed?.ok === true;
+
+    const base = {
+        ok, chars: text.length, bodyChars, overlong, narrative, lines, sections, keywords, signals,
+        // trust = "这段正文可以原样进书"：不超长、不像小说、而且真的是 JSON 交上来的
+        trust: shaped && ok && !overlong && !narrative,
+    };
+
+    if (!text.length) return { ...base, shape: 'empty', trust: false, signals: ['空输出'] };
+    if (shaped) return { ...base, shape: 'json' };
+    return { ...base, shape: narrative ? 'narrative' : 'text' };
 }
 
 /** 这次输出要不要带着纠错后缀重试？（策略见 REPAIR_JSON_SUFFIX / promptWantsJson 的注释） */
 export function needsSummaryRepair(insp, template) {
     if (!insp) return false;
     if (insp.shape === 'empty') return true;               // 空输出：多半是推理把预算烧光了
-    if (insp.shape === 'json') return insp.ok === false;   // 是 JSON 但没有可用正文
+    // 是 JSON：除了"解析不出正文"，还要求正文本身合格 —— 否则"JSON 包装的小说"会被放行（v3.1 的洞）
+    if (insp.shape === 'json') return insp.ok === false || insp.overlong === true || insp.narrative === true;
     if (insp.shape === 'narrative') return true;           // 写小说：无论提示词怎么写都算坏
     return promptWantsJson(template);                      // 纯文本：只有"提示词自己要过 JSON"才算违约
+}
+
+/**
+ * 候选正文的"坏度"：超长最致命（2 分），像小说次之（1 分），0 分才是可以进书的。
+ * 为什么不用 `trust` 直接排序：纯文本候选（没按 JSON 交作业）的 trust 也是 false，
+ * 单看 trust 会让"JSON 包装的小说"和"短纯文本"打平，接着被 SHAPE_RANK 判成 JSON 更优 —— 灾难。
+ */
+function bodyBadness(insp) {
+    if (!insp) return 4;
+    if (insp.shape === 'empty') return 3;
+    return (insp.overlong ? 2 : 0) + (insp.narrative ? 1 : 0);
 }
 
 const SHAPE_RANK = { json: 2, text: 1, narrative: 0, empty: -1 };
 
 /**
  * 多次尝试里取优（对照 CardLore 的 `pickBetterOutput`：先比字段命中数，再比保留率）。
- * 我们比的东西必须**廉价**：形状 → 关键词个数 → 更短（小说越长越是灾难）。
+ * 我们比的东西必须**廉价**：坏度（超长/像小说）→ 形状 → 关键词个数 → 更短（小说越长越是灾难）。
  * 完全同分取**后者**（它带着纠错后缀重来过，更可能是"想对了但没说完"）。
  *
  * @param {Array<{raw:string, insp:object}>} cands
@@ -368,6 +407,9 @@ export function pickBetterSummary(cands) {
     let best = null;
     for (const c of list) {
         if (!best) { best = c; continue; }
+        const ba = bodyBadness(c.insp);
+        const bb = bodyBadness(best.insp);
+        if (ba !== bb) { if (ba < bb) best = c; continue; }
         const ra = SHAPE_RANK[c.insp?.shape] ?? -1;
         const rb = SHAPE_RANK[best.insp?.shape] ?? -1;
         if (ra !== rb) { if (ra > rb) best = c; continue; }
