@@ -52,6 +52,28 @@ export function charsForTokens(tokens) {
 }
 
 /**
+ * 这次生成**允许模型吐多少 token** —— 一个数字同时管两件事：
+ *
+ *  ① 请求真实的 `max_tokens`：模型**物理上**写不出更多。这是"写小说"的硬闸 ——
+ *     提示词只能"请求"模型守格式，那个是"保证"。
+ *  ② ST 的预算预留：`chatCompletion.setTokenBudget(上下文, 最大回复长度)`，
+ *     而 quietPrompt 属于必需消息，超预算不会丢弃而是直接抛 TokenBudgetExceededError。
+ *     不声明回复长度时 ST 按**全局最大回复长度**预留 —— 用户设 4000，就为一条 200 字的
+ *     摘要白扣 4000（上下文的两成半），插件的提示词只能去挤剩下的。
+ *
+ * 系数 2.5 token/字（≈3 倍于本文件 1.2 字/token 的估算）：目标 200 字 → 500 token。
+ * 为什么留这么多余量：宁可让正文超一点（守卫会判超长并截断），也不要让 JSON 被切在半路 ——
+ * 截断的 JSON 必然判为降级，反而多烧一次纠错重试。
+ *
+ * @param {number} words 这次生成的目标字数（节点 = promptWords，骨架 = skeletonWords）
+ * @returns {number} token 上限（夹在 300–1500 之间；给 0 / NaN 时取下限）
+ */
+export function outputTokenBudget(words) {
+    const v = Number(words) > 0 ? Number(words) : 0;
+    return Math.max(300, Math.min(1500, Math.ceil(v * 2.5)));
+}
+
+/**
  * 把 token 数渲染成人读形式。
  * @param {number} n
  * @returns {string}

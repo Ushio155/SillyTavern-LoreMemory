@@ -50,7 +50,7 @@ import { SlashCommand } from '../../../slash-commands/SlashCommand.js';
 import { ARGUMENT_TYPE, SlashCommandArgument } from '../../../slash-commands/SlashCommandArgument.js';
 import { oai_settings } from '../../../../scripts/openai.js';
 
-import { estimateTokens, charsForTokens } from './src/tokens.js';
+import { estimateTokens, charsForTokens, outputTokenBudget } from './src/tokens.js';
 import {
     enforceSkeleton,
     SKELETON_FIELDS,
@@ -93,7 +93,7 @@ import {
     clampTranscriptTokens,
 } from './src/settings.js';
 import { renderPanel, booksModalHtml, escapeHtml, bookGroupKey, inputBarHtml, castPopupHtml } from './src/ui.js';
-import { isRealChatContext, noChatReason } from './src/context.js';
+import { isRealChatContext, noChatReason, promptSignature, chatCarriesPrompt } from './src/context.js';
 // 版本开关：true = 开发者版（多一个「灌入演示节点」），false = 面向用户版（只有「管理聊天书」）
 import { DEVELOPER_BUILD, BUILD_LABEL } from './src/build.js';
 
@@ -113,23 +113,49 @@ const SKELETON_LOOKBACK = 40;
  * 为什么一定要问 ST：我们的 `{{messages}}` 是拼进提示词正文的，而 quietPrompt 在 ST 里
  * 属于**必需消息**，超预算不会被丢弃、而是直接抛 TokenBudgetExceededError
  * （界面：「必要的提示词超过了上下文大小」）。
+ *
+ * ★ 一定要把 `responseLength` 传下去（v0.2.4）：预算里的"回复预留"本该是**这次**要写多少，
+ * 不传的话 ST 按**全局最大回复长度**算 —— 用户设 4000，就为一条 200 字的摘要白扣 4000。
+ * 宿主的 `getMaxPromptTokens(overrideResponseLength)` 本来就支持带 override 计算。
+ *
+ * @param {number|null} [responseLength] 这次生成声明的回复长度（token）；null = 按宿主的全局值算
  */
-function maxPromptTokenBudget() {
+function maxPromptTokenBudget(responseLength = null) {
+    const want = Number(responseLength) > 0 ? Number(responseLength) : null;
     try {
-        const n = Number(getMaxPromptTokens());
+        const n = Number(getMaxPromptTokens(want));
         if (Number.isFinite(n) && n > 0) return n;
     } catch { /* 宿主 API 变化时不要崩 */ }
     try {
         const ctx = Number(oai_settings?.openai_max_context) || Number(max_context) || 0;
-        const out = Number(oai_settings?.openai_max_tokens) || 0;
+        const out = want ?? (Number(oai_settings?.openai_max_tokens) || 0);
         if (ctx > 0) return Math.max(1, ctx - out);
     } catch { /* ignore */ }
     return 8192;
 }
 
-/** 本次生成允许读入多少 token 的聊天记录（用户设定 + ST 预算夹取） */
-function transcriptBudgetTokens() {
-    return clampTranscriptTokens(getSettings().transcriptTokens, maxPromptTokenBudget());
+/**
+ * 这次生成"要写多少字"（节点 = promptWords，骨架 = skeletonWords）。
+ * 它同时决定两件事：输出 token 上限（也就是 ST 的预算预留）与守卫的"超长"阈值。
+ */
+function targetWords(kind = 'node') {
+    const s = getSettings();
+    const fallback = kind === 'skeleton' ? 120 : 200;
+    const v = kind === 'skeleton' ? Number(s.skeletonWords) : Number(s.promptWords);
+    return v > 0 ? v : fallback;
+}
+
+/** 这次 quiet 调用要声明给 ST 的回复长度（token）—— 见 src/tokens.js 的 outputTokenBudget() */
+function quietResponseTokens(kind = 'node') {
+    return outputTokenBudget(targetWords(kind));
+}
+
+/**
+ * 本次生成允许读入多少 token 的聊天记录（用户设定 + ST 预算夹取）。
+ * @param {'node'|'skeleton'} [kind] 骨架是另一条提示词、另一个字数目标，预算口径也跟着换
+ */
+function transcriptBudgetTokens(kind = 'node') {
+    return clampTranscriptTokens(getSettings().transcriptTokens, maxPromptTokenBudget(quietResponseTokens(kind)));
 }
 
 /** 我们的聊天世界书统一用这个前缀命名（「清理空书」也靠它识别） */
@@ -145,6 +171,30 @@ let summarizingSince = 0;
 const QUIET_TIMEOUT_MS = 90000;
 /** 超过这么久还没回来，判定为卡死并复位 */
 const SUMMARIZING_STALE_MS = 150000;
+
+/**
+ * 上一次 quiet 生成的「回执」：ST 到底有没有把我们那段提示词交给模型。
+ *   true  = 在 `chat_completion_prompt_ready` 里看到了我们的签名
+ *   false = 那次真实构建里没有 —— 预算不足，quietPrompt 被静默丢掉了
+ *   null  = 无从判断（非 chat completion 源 / 没观察到构建 / 提示词太短）
+ * 完整故障链与源码行号见 src/context.js 的 `chatCarriesPrompt()`。
+ */
+let quietVerdict = null;
+/** 非空 = 正在等一次回执（只有这段时间里收到的事件才算数） */
+let quietWatch = null;
+
+/** 记下"这次要等哪段提示词的回执"（callLlm 每次调用前设、finally 里清） */
+function armQuietDelivery(prompt) {
+    quietWatch = promptSignature(prompt) || null;
+    quietVerdict = null;
+}
+
+/** 取走这次的回执（取一次就清，免得影响下一次判断） */
+function takeQuietVerdict() {
+    const v = quietVerdict;
+    quietVerdict = null;
+    return v;
+}
 
 /**
  * 「正在生成吗」的唯一入口 —— 不要直接读 `summarizing` 这个裸布尔。
@@ -572,11 +622,21 @@ function promptVars(text, count, from, to) {
     };
 }
 
-/** 调一次 quiet 生成。返回模型原始文本；失败抛异常。 */
-async function callLlm(prompt) {
+/**
+ * 调一次 quiet 生成。返回模型原始文本；失败抛异常。
+ *
+ * @param {string} prompt 提示词
+ * @param {{words?:number}} [opts] words = 这次生成的目标字数（决定输出上限与预算预留），
+ *   缺省按节点摘要的 `promptWords` 算
+ */
+async function callLlm(prompt, opts = {}) {
     const settings = getSettings();
+    const words = Number(opts.words) > 0 ? Number(opts.words) : targetWords('node');
+    const responseLength = outputTokenBudget(words);
     summarizing = true;
     summarizingSince = Date.now();
+    // 从这一刻起监听"我们的提示词到底有没有进这次请求"（见 armQuietDelivery / src/context.js）
+    armQuietDelivery(prompt);
     let timer = null;
     try {
         // 硬超时：卡住的生成不能把记账和后续总结一起拖死（见 isSummarizing 的事故说明）
@@ -585,6 +645,12 @@ async function callLlm(prompt) {
                 quietPrompt: prompt,
                 skipWIAN: !!settings.skipWIAN,
                 removeReasoning: true,
+                // ★ v0.2.4：这一个参数管两件事 ——
+                //   ① ST 的预算预留从"全局最大回复长度"降到这次真正需要的量
+                //      （用户设 4000，就为一条 200 字的摘要白扣 4000 token）；
+                //   ② 请求带上了真实 max_tokens，模型**物理上**写不出 2000 字小说。
+                //   代价与取值理由见 src/tokens.js 的 outputTokenBudget()。
+                responseLength,
             }),
             new Promise((_, reject) => {
                 timer = setTimeout(
@@ -597,6 +663,7 @@ async function callLlm(prompt) {
         if (timer) clearTimeout(timer);
         summarizing = false;
         summarizingSince = 0;
+        quietWatch = null;
     }
 }
 
@@ -628,15 +695,19 @@ function parseSummaryOutputForGuard(raw) {
  *
  * @param {string} prompt 已经渲染好的提示词
  * @param {{call?:Function, words?:number, now?:Function}} [opts] call 可注入（测试用脚本化模型）
- * @returns {Promise<{raw:string, insp:object, attempts:Array<object>, retried:boolean, repaired:boolean}>}
+ * @returns {Promise<{raw:string, insp:object, attempts:Array<object>, retried:boolean, repaired:boolean, delivered:boolean|null, deliveryFailed:boolean}>}
+ *   delivered = ST 有没有把我们这段提示词交给模型（null = 无从判断），
+ *   deliveryFailed = 明确没有（预算不足被丢掉）—— 这时候重试毫无意义，见下面的说明。
  */
 async function summarizeWithGuard(prompt, opts = {}) {
-    const call = typeof opts.call === 'function' ? opts.call : callLlm;
     const now = typeof opts.now === 'function' ? opts.now : Date.now;
     const words = Number(opts.words) > 0 ? Number(opts.words) : (Number(getSettings().promptWords) || 0);
+    const call = typeof opts.call === 'function' ? opts.call : (p) => callLlm(p, { words });
     const started = now();
     const cands = [];
     const attempts = [];
+    let delivered = null;
+    let deliveryFailed = false;
 
     for (let i = 1; i <= MAX_SUMMARY_ATTEMPTS; i++) {
         const prevShape = cands.length ? cands[cands.length - 1].insp.shape : '';
@@ -650,9 +721,20 @@ async function summarizeWithGuard(prompt, opts = {}) {
             if (i === 1) throw e;      // 第一次就失败：与原逻辑一致，交给调用方报错
             break;                     // 重试那次失败：保留已有结果，不再纠缠
         }
+        // ★ ST 有没有把我们这段话发出去？没有的话，模型看到的是"角色卡 + 聊天记录"，
+        //   写出来必然是剧情 —— 这时候再"纠错重试"两次是纯浪费：指令根本不在提示词里。
+        const verdict = takeQuietVerdict();
+        if (verdict !== null) delivered = verdict;
         const insp = inspectOutput(parseSummaryOutputForGuard(raw), raw, { words });
         cands.push({ raw, insp, attempt: i });
         attempts.push({ attempt: i, shape: insp.shape, chars: insp.chars, bodyChars: insp.bodyChars, keywords: insp.keywords, overlong: insp.overlong, narrative: insp.narrative, trust: insp.trust, signals: insp.signals });
+        if (verdict === false) {
+            // 留着这段输出（调用方会把它截断 + 标「待确认」，不会注入），但**不再重试**：
+            // 指令没进提示词这件事，重试多少次都不会变。
+            deliveryFailed = true;
+            console.warn('[LoreMemory] ST 没有把摘要提示词发出去（预算不足，quietPrompt 被静默丢掉）：本次不重试，输出会被按剧情处理并标为待确认');
+            break;
+        }
         if (!needsSummaryRepair(insp, prompt)) break;
         if (i >= MAX_SUMMARY_ATTEMPTS) break;
         if (now() - started > RETRY_BUDGET_MS) {
@@ -668,7 +750,7 @@ async function summarizeWithGuard(prompt, opts = {}) {
     if (retried) {
         console.log(`[LoreMemory] 摘要输出不合格，纠错重试 ${cands.length} 次：`, JSON.stringify(attempts));
     }
-    return { raw: best.raw, insp: best.insp, attempts, retried, repaired };
+    return { raw: best.raw, insp: best.insp, attempts, retried, repaired, delivered, deliveryFailed };
 }
 
 /**
@@ -721,7 +803,9 @@ function gateKeys(rawKeys, from, to) {
  * @param {string} raw 模型原始输出
  * @param {number} from 0 基起始下标（含）
  * @param {number} to 0 基结束下标（含）
- * @param {{attempts?:number}} [meta] attempts = 这次落库前一共调了几次模型（守卫重试用，只影响提示文案）
+ * @param {{attempts?:number, trusted?:boolean, deliveryFailed?:boolean}} [meta]
+ *   attempts = 这次落库前一共调了几次模型（守卫重试用，只影响提示文案）；
+ *   trusted = 守卫的判词；deliveryFailed = ST 根本没把摘要指令发出去（v0.2.4）
  */
 async function applyNodeOutput(raw, from, to, meta = {}) {
     const ctx = getCtx();
@@ -735,8 +819,12 @@ async function applyNodeOutput(raw, from, to, meta = {}) {
     // 守卫在"调模型那一层"给出的判词：这段正文可不可以原样进书（v3.1 新增）。
     // 缺省（老调用 / 测试脚本直接驱动）按**不信任**处理 —— 反过来的默认值会让小说漏过去。
     const guardFlagged = meta.trusted === false;
+    // ★ v0.2.4：ST 因为预算不足把 quietPrompt 整个丢掉了 —— 这次请求里根本没有"归档"这条指令，
+    //   模型看到的是角色卡 + 聊天记录，写出来的是剧情。这跟"模型不听话"是两码事：
+    //   用户要改的是 AI 设置（上下文/最大回复长度），不是提示词。所以必须单独认出来并说清楚。
+    const hostDropped = meta.deliveryFailed === true;
     // 关键词被剔光 = 这个节点永远不会被召回 → 交给人工确认（面板里的「改关键词」）
-    const review = degraded || guardFlagged || !g.structuralOk || g.keys.length === 0;
+    const review = hostDropped || degraded || guardFlagged || !g.structuralOk || g.keys.length === 0;
 
     // ★ 正文长度闸门（v3 起，v3.1 扩容）。实测事故：模型顺着 RP 文风续写，输出 4089 字 / 117 行的小说，
     //   而这里**原样收下**当正文 —— 用户那本书 21 条里 7 条是这么来的。
@@ -745,7 +833,7 @@ async function applyNodeOutput(raw, from, to, meta = {}) {
     //   v3.1 的教训：闸门**不能只认"没按 JSON 输出"** —— 模型完全可能交出格式正确的 JSON，
     //   却把一整篇小说塞进 `summary` 字段（提示词越强调 JSON 越容易这样）。所以现在只要
     //   守卫说这段正文不可信（`trusted === false`）就截断：不像归档的东西一律按降级处理。
-    const capNeeded = degraded || guardFlagged;
+    const capNeeded = degraded || guardFlagged || hostDropped;
     const cap = capNeeded
         ? capNodeBody(parsed.summary, { maxChars: charsForTokens(Number(settings.nodeTokenCap) || 200) })
         : { content: parsed.summary, truncated: false, chars: parsed.summary.length, kept: parsed.summary.length };
@@ -780,14 +868,16 @@ async function applyNodeOutput(raw, from, to, meta = {}) {
     render();
 
     const tail = cap.truncated ? `，正文已截到 ${cap.kept} 字（原文 ${cap.chars} 字，可「回滚正文」取回）` : '';
-    const why = !parsed.keywords.length
-        ? `关键词为空（提示词可能没有按要求输出 JSON）${attempts > 1 ? `，已纠错重试 ${attempts} 次` : ''}`
-        : (degraded ? `模型没有按 JSON 输出${attempts > 1 ? `（已纠错重试 ${attempts} 次仍不合格）` : ''}，已按纯文本处理并用兜底规则抽词${tail}`
-            : (guardFlagged
-                ? `守卫判定这次正文不像归档（${parsed.summary.length} 字，不像"发生了什么/谁在场"那种结构），已按剧情处理${tail}`
-                : (g.dropped.length
-                    ? `已剔除会误触发的关键词：${g.dropped.map(d => `${d.key}（${Math.round(d.allRatio * 100)}% 的消息里出现）`).join('、')}`
-                    : (g.structuralWarn[0] || ''))));
+    const why = hostDropped
+        ? `这次 ST 没有把摘要指令发出去（提示词预算不足，quietPrompt 被丢掉了），模型看到的是角色卡+聊天记录、写出来的是剧情。请调大「上下文大小」、调小「最大回复长度」，或调小本插件的「单次生成读入的记录上限」${tail}`
+        : (!parsed.keywords.length
+            ? `关键词为空（提示词可能没有按要求输出 JSON）${attempts > 1 ? `，已纠错重试 ${attempts} 次` : ''}`
+            : (degraded ? `模型没有按 JSON 输出${attempts > 1 ? `（已纠错重试 ${attempts} 次仍不合格）` : ''}，已按纯文本处理并用兜底规则抽词${tail}`
+                : (guardFlagged
+                    ? `守卫判定这次正文不像归档（${parsed.summary.length} 字，不像"发生了什么/谁在场"那种结构），已按剧情处理${tail}`
+                    : (g.dropped.length
+                        ? `已剔除会误触发的关键词：${g.dropped.map(d => `${d.key}（${Math.round(d.allRatio * 100)}% 的消息里出现）`).join('、')}`
+                        : (g.structuralWarn[0] || '')))));
 
     if (review) {
         toast(`节点 ${node.id} 已写入但标为「待确认」并暂时禁用：${why}。请在节点列表里点「改关键词」修好后启用。`, 'warning');
@@ -840,12 +930,18 @@ async function summarizePending({ manual = false } = {}) {
     let raw;
     let attempts = 1;
     let trusted = false;
+    let deliveryFailed = false;
     try {
         const gen = await summarizeWithGuard(built.prompt);
         raw = gen.raw;
         attempts = gen.attempts.length || 1;
         trusted = gen.insp?.trust === true;
-        if (gen.retried) {
+        deliveryFailed = gen.deliveryFailed === true;
+        if (deliveryFailed) {
+            // ★ 这一类失败不是"模型不听话"，而是 ST 的提示词预算不够、把我们的归档指令整个丢掉了
+            //   （ST 不报错、还正常返回一段文本）。不说清楚的话，用户只会去折腾提示词。
+            toast('ST 没能把摘要指令发出去（提示词预算不足，界面通常同时弹「必要的提示词超过了上下文大小」）：模型写的是剧情，不是摘要。请调大「上下文大小」、调小「最大回复长度」，或调小本插件的「单次生成读入的记录上限」。', 'error');
+        } else if (gen.retried) {
             const how = gen.repaired ? '纠错后已按格式返回' : '纠错后仍不合格，按降级处理';
             if (manual) toast(`模型没有按格式返回，已纠错重试 ${attempts} 次：${how}`, 'info');
         }
@@ -855,7 +951,7 @@ async function summarizePending({ manual = false } = {}) {
         return { ok: false, reason: 'llm-error' };
     }
 
-    const applied = await applyNodeOutput(raw, from, to, { attempts, trusted });
+    const applied = await applyNodeOutput(raw, from, to, { attempts, trusted, deliveryFailed });
     if (!applied.ok) {
         toast('摘要返回空内容，本次放弃（游标未推进，可重试）', 'error');
         return applied;
@@ -878,7 +974,7 @@ async function refreshSkeleton(state, { manual = false } = {}) {
     // （骨架要的是"现在"，所以丢的是最旧的；实测 40 楼可达 7,700 token，足以顶爆上下文）
     const windowStart = Math.max(0, chat.length - SKELETON_LOOKBACK);
     const fit = fitTranscriptByTokens(chat.slice(windowStart), {
-        maxTokens: transcriptBudgetTokens(),
+        maxTokens: transcriptBudgetTokens('skeleton'),
         estimate: estimateTokens,
         fromOldest: false,
         scope: settings.scanScope,
@@ -898,11 +994,16 @@ async function refreshSkeleton(state, { manual = false } = {}) {
 
     let raw;
     try {
-        raw = await callLlm(prompt);
+        raw = await callLlm(prompt, { words: targetWords('skeleton') });
     } catch (e) {
         console.error('[LoreMemory] 骨架刷新失败', e);
         toast(`骨架刷新失败：${e?.message || e}`, 'error');
         return { ok: false };
+    }
+    // ST 因为预算不足把提示词丢掉了：这次输出必然不是那张卡，别拿它去套模板（也把真因说出来）
+    if (takeQuietVerdict() === false) {
+        toast('ST 没能把骨架提示词发出去（提示词预算不足，界面通常同时弹「必要的提示词超过了上下文大小」）。请调大「上下文大小」、调小「最大回复长度」，或调小本插件的「单次生成读入的记录上限」。', 'error');
+        return { ok: false, reason: 'budget-dropped' };
     }
     // ── 硬闸门 ──
     // 提示词只能"请求"模型守规矩，这里才"保证"：结构化过滤掉叙述体 + 按 skeletonTokenCap 裁剪。
@@ -970,6 +1071,12 @@ async function resummarizeNode(state, node) {
     const prompt = renderPrompt(settings.prompt, promptVars(text, used, from, to));
     let gen;
     try { gen = await summarizeWithGuard(prompt); } catch (e) { toast(`重摘要失败：${e?.message || e}`, 'error'); return; }
+    // 指令没发出去 → 这次拿回来的东西不是摘要（见 applyNodeOutput 里的同类判断）。
+    // 重摘要是有费用的手工动作，宁可不覆盖正文，也不要把一段剧情写进节点。
+    if (gen.deliveryFailed) {
+        toast('ST 没能把摘要指令发出去（提示词预算不足）：这次返回的是剧情而不是摘要，已放弃覆盖（原正文未改动）。请先调大「上下文大小」或调小「最大回复长度」。', 'error');
+        return { ok: false, reason: 'budget-dropped' };
+    }
     const raw = gen.raw;
 
     const ctx = getCtx();
@@ -2875,6 +2982,18 @@ async function init() {
     // 核心：账本完全依赖 ST 的扫描结果，插件不模拟扫描
     eventSource.on(event_types.WORLDINFO_SCAN_DONE, onScanDone);
 
+    // 「ST 到底有没有把我们这段提示词交给模型」—— 预算不足时 quietPrompt 会被静默丢掉
+    // （ST 只弹一句 toast 就照常把残缺的 chat 发出去，故障链见 src/context.js）。
+    // 只在我们等回执的那段时间里算数（armQuietDelivery），ST 自己的试算/预演（dryRun）一律不算。
+    eventSource.on(event_types.CHAT_COMPLETION_PROMPT_READY, (data) => {
+        try {
+            if (!quietWatch) return;
+            if (!data || data.dryRun) return;
+            if (chatCarriesPrompt(data.chat, quietWatch)) quietVerdict = true;
+            else if (quietVerdict !== true) quietVerdict = false;
+        } catch { /* 宿主结构变化时不要崩 */ }
+    });
+
     // 钉选 / 按角色召回的**重新武装**点。
     // ST 把 externalActivations 当成"全局一次性"表（每次扫描结尾无条件清空，L5156），
     // 而本事件在每次扫描的激活循环之前、且是 await 的（L4492）—— 在这里补喂，
@@ -2980,6 +3099,16 @@ window.LoreMemory = {
     summarizeWithGuard, inspectOutput, capNodeBody,
     // 上下文预算：driver 用它断言"读入的记录真的被预算夹住了"
     maxPromptTokenBudget, transcriptBudgetTokens,
+    // 输出上限（同时是 ST 的预算预留与请求的 max_tokens）与"这次要写多少字"
+    outputTokenBudget, targetWords, quietResponseTokens,
+    // 「ST 有没有把我们这段提示词发出去」的回执：arm() 模拟 callLlm 的动作，
+    // 让"预算不足导致指令被丢掉"这条链路不必真的联网也能端到端验证（见 src/context.js）
+    quietDelivery: {
+        get verdict() { return quietVerdict; },
+        get watching() { return quietWatch; },
+        arm: armQuietDelivery,
+        take: takeQuietVerdict,
+    },
     render, scheduleAutoWork,
     // 让自动化测试能确定性地把 chat_metadata 落盘（切页面/重载前必须等它，
     // 否则重载后读到的是上一版状态 —— driver 在 [I] 段踩过这个坑）

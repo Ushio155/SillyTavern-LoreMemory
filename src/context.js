@@ -61,3 +61,47 @@ export function noChatReason(ctx) {
     }
     return '还没有选中角色卡或群聊，插件不会建书';
 }
+
+/**
+ * 取一段提示词的「签名」：开头那段非空白文本，用来事后确认 ST 到底有没有把它交给模型。
+ *
+ * 取 40 字：短到必然落在任何模板/任何模型的提示词开头，长到不会撞上别人的文本。
+ * 太短的提示词（< 8 字）返回空串 = **放弃判断**，宁可不判，也不要拿一个会误命中别的
+ * 提示词的签名去冤枉宿主。
+ *
+ * @param {string} text 我们这次要发出去的提示词
+ * @param {number} [len=40] 取多少字
+ * @returns {string} 签名；空串表示无从判断
+ */
+export function promptSignature(text, len = 40) {
+    const s = String(text ?? '').trim();
+    if (s.length < 8) return '';
+    const n = Math.max(8, Math.min(200, Number(len) > 0 ? Number(len) : 40));
+    return s.slice(0, n);
+}
+
+/**
+ * ST 交给模型的这次 chat 里，有没有我们那段提示词？
+ *
+ * 为什么需要它（真实故障链，ST 1.18.0，源码行号见 scripts/openai.js）：
+ *  · `quietPrompt` 属于**必需消息**：它被放进 controlPrompts，并在 populateChatCompletion
+ *    的**最后**才 `chatCompletion.add(controlPrompts)`（L1337）；
+ *  · 预算 = `上下文 − 最大回复长度`（setTokenBudget，L1558/L3891）。扣掉角色卡、主提示词、
+ *    越狱提示词之后放不下它时，`checkTokenBudget` 抛 TokenBudgetExceededError（L4104-4107）；
+ *  · 而这个异常被**吞掉且不中止**：L1579-1584 只弹一句「必要的提示词超过了上下文大小」、
+ *    设一下 `promptManager.error`，随后 L1607 照常把**残缺的** chat 发出去；
+ *  · 于是模型收到的是"角色卡 + 聊天记录，没有归档指令" —— 它当然顺着 RP 往下写小说。
+ *    插件这边 `generateQuietPrompt` 正常 resolve，看起来像一次成功的摘要。
+ *
+ * 这条判据把「指令根本没发出去」和「模型不听话」分开：前者重试多少次都没用，
+ * 而且插件的输出守卫也无从分辨（两者都是"一段散文"）。
+ *
+ * @param {Array<{content?:any}>} chat `chat_completion_prompt_ready` 事件带出来的消息数组
+ * @param {string} signature promptSignature() 的结果；空串 = 无从判断
+ * @returns {boolean} true = 带上了；false = 这次没带上
+ */
+export function chatCarriesPrompt(chat, signature) {
+    if (!signature) return false;
+    if (!Array.isArray(chat)) return false;
+    return chat.some(m => typeof m?.content === 'string' && m.content.includes(signature));
+}
